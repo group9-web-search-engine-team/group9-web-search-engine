@@ -60,7 +60,7 @@ public class S3RawHtmlBolt extends BaseRichBolt {
      */
     public static final String S3_STATUS_STREAM = "s3-fetched-status";
     public static final Fields S3_STATUS_FIELDS =
-            new Fields("url", "httpStatus", "contentLength", "s3Key");
+            new Fields("url", "httpStatus", "contentLength", "s3Key", "qualityScore");
 
     /**
      * Dedicated stream carrying discovered outlinks as PRIMITIVE/String tuple fields
@@ -79,6 +79,7 @@ public class S3RawHtmlBolt extends BaseRichBolt {
 
     private transient OutputCollector collector;
     private transient S3Client s3;
+    private transient com.group9.websearch.crawler.quality.Qt5QualityClient qualityClient;
 
     private String bucket;
     private String prefix;
@@ -97,8 +98,21 @@ public class S3RawHtmlBolt extends BaseRichBolt {
         this.region = strConf(conf, CrawlerConstants.S3_REGION_PARAM, null);
 
         this.s3 = buildClient(region);
-        LOG.info("S3RawHtmlBolt ready: bucket={} prefix={} region={}",
-                bucket, prefix, region == null ? "<default-chain>" : region);
+
+        // QT5 quality scorer (optional). Disabled by default so the crawler runs without
+        // the Python service; fails safe at request time if the service is unavailable.
+        boolean qtEnabled = boolConf(conf, CrawlerConstants.QT5_ENABLED_PARAM,
+                CrawlerConstants.DEFAULT_QT5_ENABLED);
+        String qtUrl = strConf(conf, CrawlerConstants.QT5_URL_PARAM, CrawlerConstants.DEFAULT_QT5_URL);
+        int qtTimeout = intConf(conf, CrawlerConstants.QT5_TIMEOUT_MS_PARAM,
+                CrawlerConstants.DEFAULT_QT5_TIMEOUT_MS);
+        int qtMaxChars = intConf(conf, CrawlerConstants.QT5_MAX_CHARS_PARAM,
+                CrawlerConstants.DEFAULT_QT5_MAX_CHARS);
+        this.qualityClient = new com.group9.websearch.crawler.quality.Qt5QualityClient(
+                qtUrl, java.time.Duration.ofMillis(qtTimeout), qtMaxChars, qtEnabled);
+
+        LOG.info("S3RawHtmlBolt ready: bucket={} prefix={} region={} qt5Enabled={}",
+                bucket, prefix, region == null ? "<default-chain>" : region, qtEnabled);
     }
 
     /** Build an S3 client using the default credential provider chain. */
@@ -146,7 +160,7 @@ public class S3RawHtmlBolt extends BaseRichBolt {
         }
 
         if (uploaded) {
-            emitFetched(tuple, url, metadata, key);
+            emitFetched(tuple, url, content, metadata, key);
             emitDiscoveredLinks(tuple, url, content, metadata);
         }
         collector.ack(tuple);
@@ -226,17 +240,46 @@ public class S3RawHtmlBolt extends BaseRichBolt {
      * empty at the downstream {@link PostgresStatusUpdaterBolt}. Primitive/String fields
      * serialize reliably, so the status updater persists real values instead of nulls.
      *
+     * <p>It also extracts plain page text and requests a QT5-Small quality score from the
+     * local scoring service. The score is the model's RAW log-probability (kept distinct
+     * from pagerank / QMax). Scoring is fail-safe: if the service is disabled or
+     * unavailable, {@code qualityScore} is emitted as {@code null} and the page is still
+     * persisted — the crawl never blocks on the scorer.
+     *
      * @param anchor the input tuple to anchor the emission to (for acking)
      * @param url    the fetched page URL
+     * @param content the raw HTML bytes (used to extract plain text for scoring)
      * @param metadata the fetched page metadata (non-empty at this point)
      * @param s3Key  the S3 object key for the stored raw HTML
      */
-    private void emitFetched(Tuple anchor, String url, Metadata metadata, String s3Key) {
+    private void emitFetched(Tuple anchor, String url, byte[] content, Metadata metadata, String s3Key) {
         Integer httpStatus = parseNullableInt(metadata.getFirstValue("fetch.statusCode"));
         Long contentLength = parseNullableLong(metadata.getFirstValue("fetch.byteLength"));
-        LOG.info("S3 emitting FETCHED scalars for {}: httpStatus={}, contentLength={}, s3Key={}",
-                url, httpStatus, contentLength, s3Key);
-        collector.emit(S3_STATUS_STREAM, anchor, new Values(url, httpStatus, contentLength, s3Key));
+        Double qualityScore = scoreQuality(url, content, metadata);
+        LOG.info("S3 emitting FETCHED scalars for {}: httpStatus={}, contentLength={}, s3Key={}, quality={}",
+                url, httpStatus, contentLength, s3Key, qualityScore);
+        collector.emit(S3_STATUS_STREAM, anchor,
+                new Values(url, httpStatus, contentLength, s3Key, qualityScore));
+    }
+
+    /**
+     * Extract plain text from the HTML and score it with QT5-Small via the local service.
+     * Returns null if scoring is disabled, the text is empty, or the service is unavailable
+     * (fail-safe). The raw QT5 log-probability is returned unchanged (not normalised).
+     */
+    private Double scoreQuality(String url, byte[] content, Metadata metadata) {
+        if (qualityClient == null || !qualityClient.isEnabled()) {
+            return null;
+        }
+        try {
+            String charset = charsetFrom(metadata);
+            String html = new String(content, java.nio.charset.Charset.forName(charset));
+            String text = org.jsoup.Jsoup.parse(html, url).text();
+            return qualityClient.score(text).orElse(null);
+        } catch (Exception e) {
+            LOG.warn("Quality scoring skipped for {}: {}", url, e.toString());
+            return null;
+        }
     }
 
     @Override
@@ -309,5 +352,33 @@ public class S3RawHtmlBolt extends BaseRichBolt {
     private static String strConf(Map conf, String key, String def) {
         Object v = conf == null ? null : conf.get(key);
         return v == null ? def : v.toString();
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static int intConf(Map conf, String key, int def) {
+        Object v = conf == null ? null : conf.get(key);
+        if (v == null) {
+            return def;
+        }
+        if (v instanceof Number n) {
+            return n.intValue();
+        }
+        try {
+            return Integer.parseInt(v.toString().trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static boolean boolConf(Map conf, String key, boolean def) {
+        Object v = conf == null ? null : conf.get(key);
+        if (v == null) {
+            return def;
+        }
+        if (v instanceof Boolean b) {
+            return b;
+        }
+        return Boolean.parseBoolean(v.toString().trim());
     }
 }

@@ -137,6 +137,11 @@ public class CrawlerTopologyRunner extends ConfigurableTopology {
         StormTopology topology = builder.createTopology();
         LOG.info("Submitting topology '{}' to LocalCluster for {}s (bounded smoke crawl)",
                 TOPOLOGY_NAME, ttlSeconds);
+
+        // Optional topic distillation: a periodic, overlap-guarded background pass that
+        // promotes hub neighbours in the frontier. Runs interspersed with crawling, not per
+        // page. Disabled by default; fully separate from the per-page QMax path.
+        com.group9.websearch.crawler.distill.DistillationScheduler distiller = maybeStartDistiller(conf);
         try (LocalCluster cluster = new LocalCluster()) {
             cluster.submitTopology(TOPOLOGY_NAME, conf, topology);
             long deadline = System.currentTimeMillis() + ttlSeconds * 1000L;
@@ -153,8 +158,41 @@ public class CrawlerTopologyRunner extends ConfigurableTopology {
         } catch (Exception e) {
             LOG.error("Local run failed", e);
             return 1;
+        } finally {
+            if (distiller != null) {
+                distiller.stop();
+            }
         }
         return 0;
+    }
+
+    /**
+     * Start the distillation scheduler if {@code distill.enabled} is true. Returns the
+     * scheduler (to stop later) or null when disabled. The DB password is read from the
+     * same env var the crawler uses; distillation shares the configured crawler role.
+     */
+    private com.group9.websearch.crawler.distill.DistillationScheduler maybeStartDistiller(Config conf) {
+        boolean enabled = boolConf(conf, CrawlerConstants.DISTILL_ENABLED_PARAM,
+                CrawlerConstants.DEFAULT_DISTILL_ENABLED);
+        if (!enabled) {
+            return null;
+        }
+        String url = strConf(conf, CrawlerConstants.PG_URL_PARAM, CrawlerConstants.DEFAULT_PG_URL);
+        String user = strConf(conf, CrawlerConstants.PG_USER_PARAM, CrawlerConstants.DEFAULT_PG_USER);
+        String passwordEnv = strConf(conf, CrawlerConstants.PG_PASSWORD_ENV_PARAM,
+                CrawlerConstants.DEFAULT_PG_PASSWORD_ENV);
+        String password = System.getenv(passwordEnv);
+        int interval = intConf(conf, CrawlerConstants.DISTILL_INTERVAL_SECS_PARAM,
+                CrawlerConstants.DEFAULT_DISTILL_INTERVAL_SECS);
+        int topHubs = intConf(conf, CrawlerConstants.DISTILL_TOP_HUBS_PARAM,
+                CrawlerConstants.DEFAULT_DISTILL_TOP_HUBS);
+        double boost = doubleConf(conf, CrawlerConstants.DISTILL_BOOST_PARAM,
+                CrawlerConstants.DEFAULT_DISTILL_BOOST);
+        com.group9.websearch.crawler.distill.DistillationScheduler scheduler =
+                new com.group9.websearch.crawler.distill.DistillationScheduler(
+                        url, user, password, interval, topHubs, boost);
+        scheduler.start();
+        return scheduler;
     }
 
     private static boolean hasFlag(String[] args, String flag) {
@@ -315,5 +353,46 @@ public class CrawlerTopologyRunner extends ConfigurableTopology {
     private static String strConf(Config conf, String key, String def) {
         Object v = conf.get(key);
         return v == null ? def : v.toString();
+    }
+
+    private static boolean boolConf(Config conf, String key, boolean def) {
+        Object v = conf.get(key);
+        if (v == null) {
+            return def;
+        }
+        if (v instanceof Boolean b) {
+            return b;
+        }
+        return Boolean.parseBoolean(v.toString().trim());
+    }
+
+    private static int intConf(Config conf, String key, int def) {
+        Object v = conf.get(key);
+        if (v == null) {
+            return def;
+        }
+        if (v instanceof Number n) {
+            return n.intValue();
+        }
+        try {
+            return Integer.parseInt(v.toString().trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    private static double doubleConf(Config conf, String key, double def) {
+        Object v = conf.get(key);
+        if (v == null) {
+            return def;
+        }
+        if (v instanceof Number n) {
+            return n.doubleValue();
+        }
+        try {
+            return Double.parseDouble(v.toString().trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
     }
 }

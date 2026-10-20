@@ -257,4 +257,85 @@ class FrontierRepositoryTest {
         verify(connection).prepareStatement(
                 org.mockito.ArgumentMatchers.contains("state = 'in_progress'"));
     }
+
+    @Test
+    void updateQualityScoreBindsScoreAndUrlAndReportsUpdate() throws SQLException {
+        when(ps.executeUpdate()).thenReturn(1);
+        assertTrue(repo.updateQualityScore("https://example.com/", -2.5));
+        verify(ps).setDouble(1, -2.5);
+        verify(ps).setString(2, "https://example.com/");
+        verify(connection).prepareStatement(
+                org.mockito.ArgumentMatchers.contains("UPDATE documents SET quality_score"));
+    }
+
+    @Test
+    void updateQualityScoreReturnsFalseWhenNoDocumentRow() throws SQLException {
+        when(ps.executeUpdate()).thenReturn(0);
+        assertFalse(repo.updateQualityScore("https://missing/", -1.0));
+    }
+
+    // ---- QMax (unit-level: SQL/binding; full semantics covered by the integration test) ----
+
+    @Test
+    void computeQMaxReturnsMaxParentScore() throws SQLException {
+        ResultSet rs = mock(ResultSet.class);
+        when(ps.executeQuery()).thenReturn(rs);
+        when(rs.next()).thenReturn(true);
+        when(rs.getDouble(1)).thenReturn(-2.0);
+        when(rs.wasNull()).thenReturn(false);
+        java.util.OptionalDouble q = repo.computeQMax("https://dest/");
+        assertTrue(q.isPresent());
+        assertEquals(-2.0, q.getAsDouble());
+        verify(connection).prepareStatement(
+                org.mockito.ArgumentMatchers.contains("max(d.quality_score)"));
+    }
+
+    @Test
+    void computeQMaxEmptyWhenNoScoredParent() throws SQLException {
+        ResultSet rs = mock(ResultSet.class);
+        when(ps.executeQuery()).thenReturn(rs);
+        when(rs.next()).thenReturn(true);
+        when(rs.getDouble(1)).thenReturn(0.0);
+        when(rs.wasNull()).thenReturn(true); // SQL max() over no scored parents is NULL
+        assertTrue(repo.computeQMax("https://dest/").isEmpty());
+    }
+
+    @Test
+    void recomputeQMaxForDestinationWritesDocAndPriority() throws SQLException {
+        // computeQMax query returns -1.5; then two UPDATEs (documents.qmax_score, priority).
+        PreparedStatement sel = mock(PreparedStatement.class);
+        PreparedStatement updDoc = mock(PreparedStatement.class);
+        PreparedStatement updPri = mock(PreparedStatement.class);
+        when(connection.prepareStatement(org.mockito.ArgumentMatchers.contains("max(d.quality_score)")))
+                .thenReturn(sel);
+        when(connection.prepareStatement(org.mockito.ArgumentMatchers.contains("SET qmax_score")))
+                .thenReturn(updDoc);
+        when(connection.prepareStatement(org.mockito.ArgumentMatchers.contains("crawl_state SET priority")))
+                .thenReturn(updPri);
+        ResultSet rs = mock(ResultSet.class);
+        when(sel.executeQuery()).thenReturn(rs);
+        when(rs.next()).thenReturn(true);
+        when(rs.getDouble(1)).thenReturn(-1.5);
+        when(rs.wasNull()).thenReturn(false);
+
+        java.util.OptionalDouble applied = repo.recomputeQMaxForDestination("https://dest/");
+
+        assertTrue(applied.isPresent());
+        assertEquals(-1.5, applied.getAsDouble());
+        verify(updDoc).setDouble(1, -1.5);
+        verify(updDoc).setString(2, "https://dest/");
+        verify(updPri).setDouble(1, -1.5);
+        verify(updPri).setString(2, "https://dest/");
+    }
+
+    @Test
+    void recomputeQMaxForDestinationNoopWhenNoParentScore() throws SQLException {
+        ResultSet rs = mock(ResultSet.class);
+        when(ps.executeQuery()).thenReturn(rs);
+        when(rs.next()).thenReturn(true);
+        when(rs.getDouble(1)).thenReturn(0.0);
+        when(rs.wasNull()).thenReturn(true);
+        // Only the SELECT runs; no UPDATE should be issued. We assert it returns empty.
+        assertTrue(repo.recomputeQMaxForDestination("https://dest/").isEmpty());
+    }
 }

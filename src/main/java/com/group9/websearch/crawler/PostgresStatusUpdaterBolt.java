@@ -134,6 +134,10 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
             if (srcDocId.isPresent()) {
                 OptionalLong destDocId = repository.findDocId(destUrl);
                 repository.insertLink(srcDocId.getAsLong(), destDocId, destUrl, anchor);
+                // A new parent edge may raise this destination's QMax (if the source page
+                // already has a QT5 score). Recompute-from-scratch is idempotent and never
+                // lowers QMax when the new parent scores lower.
+                repository.recomputeQMaxForDestination(destUrl);
             } else {
                 LOG.debug("No source doc_id yet for {}; link to {} not recorded this pass",
                         sourceUrl, destUrl);
@@ -155,10 +159,23 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
         Integer httpStatus = (Integer) tuple.getValueByField("httpStatus");
         Long contentLength = (Long) tuple.getValueByField("contentLength");
         String s3Key = (String) tuple.getValueByField("s3Key");
+        Double qualityScore = (Double) tuple.getValueByField("qualityScore");
 
         try {
             DocumentRecord doc = new DocumentRecord(url, httpStatus, contentLength, s3Key, Instant.now());
             repository.upsertDocument(doc);
+            // Persist the QT5 quality score (kept distinct from pagerank/QMax). Only when a
+            // score is present; the UPDATE is idempotent so retries stay consistent.
+            if (qualityScore != null) {
+                repository.updateQualityScore(url, qualityScore);
+                // QMax PROPAGATION: this page now has a QT5 score, so propagate it to every
+                // URL it links to -- QMax(child) = max over parents' quality_score. The
+                // child's frontier priority is updated so higher-QMax URLs are claimed first.
+                int propagated = repository.recomputeQMaxForChildrenOf(url);
+                if (propagated > 0) {
+                    LOG.info("QMax propagated from {} to {} child URL(s)", url, propagated);
+                }
+            }
             repository.markTerminal(url, FrontierRepository.STATE_FETCHED);
             _collector.ack(tuple);
         } catch (SQLException e) {
@@ -283,6 +300,15 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
         }
     }
 
+    /**
+     * Safe-default frontier priority for a newly discovered URL whose QMax is not yet
+     * known (no parent has a QT5 score yet). It is a high positive value so that, under
+     * the frontier's {@code ORDER BY priority DESC}, unknown-QMax URLs are explored BEFORE
+     * URLs that have already received a (negative, log-prob) QMax. This avoids
+     * hard-discarding newly discovered pages and lets valuable pages be reached via
+     * low-scoring parents. Once a parent's QT5 score arrives, QMax propagation overwrites
+     * this with the real (negative) QMax value.
+     */
     private static double defaultPriority() {
         return 500.0;
     }

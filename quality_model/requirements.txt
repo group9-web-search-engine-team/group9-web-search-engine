@@ -1,0 +1,13 @@
+# QT5-Small page-quality scorer dependencies (CPU-only).
+# Install with:  py -m pip install -r quality_model/requirements.txt
+#
+# torch CPU build: on Windows, `pip install torch` pulls the CPU wheel by default.
+# transformers provides T5 (AutoModelForSeq2SeqLM) + tokenizer and HF Hub download/cache.
+torch>=2.2,<3
+transformers>=4.40,<5
+# sentencepiece is required by the T5 tokenizer (spiece.model).
+sentencepiece>=0.1.99
+# safetensors is used to load model.safetensors.
+safetensors>=0.4
+# pytest for the Python test suite.
+pytest>=8.0

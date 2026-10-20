@@ -26,6 +26,18 @@ credentials
 # Local test / property-based testing state
 .jqwik-database
 
+# Python (quality_model): venvs, caches, compiled files, downloaded model weights
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+# Hugging Face model cache (weights must NOT be committed)
+.cache/
+hf_cache/
+*.safetensors
+*.bin
+
 # IDE and OS files
 .idea/
 .vscode/

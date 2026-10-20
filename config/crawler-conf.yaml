@@ -116,6 +116,29 @@ config:
   # the group9-crawler identity, so the region cannot be auto-discovered). Adjust if needed.
   s3.region: "us-east-1"
 
+  # ---------------- QT5-Small page-quality scorer (OPTIONAL; OFF by default) ----------------
+  # When enabled, the S3 bolt extracts page text and calls the local Python scoring
+  # service (quality_model/qt5_server.py) for a QT5-Small quality score, persisted to
+  # documents.quality_score. It fails safe: if the service is down/slow the crawl still
+  # stores the page (quality stays null). Start the service first (see quality_model/README).
+  # The raw QT5 log-prob is kept DISTINCT from pagerank/QMax.
+  qt5.enabled: true
+  qt5.service.url: "http://127.0.0.1:8077"
+  qt5.timeout.ms: 5000
+  qt5.max.chars: 20000
+
+  # ---------------- Topic distillation (OPTIONAL; OFF by default) ----------------
+  # Relevance-conscious hub/authority distillation (Chakrabarti et al. 1999), adapted with
+  # QT5 as the relevance signal. A periodic background pass selects top hubs via weighted
+  # HITS over the links graph and raises distill_boost on hubs' unvisited pending neighbours.
+  # distill_boost is SEPARATE from priority/qmax, and the soft-focus ordering
+  # (attempt_count ASC first) means a boost can never override attempt-count-first ordering.
+  # The interval is an engineering default (the paper mandates none).
+  distill.enabled: true
+  distill.interval.secs: 120
+  distill.top.hubs: 10
+  distill.boost: 1000.0
+
   # ---------------- Optional seed emit cap (OFF by default) ----------------
   # crawl.max.seeds caps how many SEED tuples BoundedFileSpout emits. Leave unset (or <= 0)
   # for normal runs so ALL seeds are crawled. Set a small positive value ONLY for a very

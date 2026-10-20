@@ -2,6 +2,7 @@ package com.group9.websearch.crawler;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -128,6 +129,9 @@ class S3RawHtmlBoltTest {
         String s3Key = (String) v.get(3);
         assertTrue(s3Key != null && s3Key.startsWith("crawl/raw/smoke-test/") && s3Key.endsWith(".html"),
                 "s3Key should be set on success, was: " + s3Key);
+        // qualityScore (field 4) is null here because no QT5 client is injected (scoring
+        // is fail-safe/optional); it is populated only when the scorer is enabled+reachable.
+        assertNull(v.get(4), "qualityScore should be null when the QT5 client is absent");
 
         verify(s3, times(1)).putObject(any(PutObjectRequest.class), any(RequestBody.class));
     }

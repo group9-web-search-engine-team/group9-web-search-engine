@@ -48,6 +48,39 @@ public final class CrawlerConstants {
     public static final String DEFAULT_S3_BUCKET = "web-search-engine-group9-2026-corp";
     public static final String DEFAULT_S3_PREFIX = "crawl/raw/";
 
+    // ---- Topic distillation (optional; hub/authority promotion of frontier priority) ----
+
+    /** Enable periodic topic distillation (default false). */
+    public static final String DISTILL_ENABLED_PARAM = "distill.enabled";
+    /** Interval in seconds between distillation passes. */
+    public static final String DISTILL_INTERVAL_SECS_PARAM = "distill.interval.secs";
+    /** Number of top hubs selected per pass. */
+    public static final String DISTILL_TOP_HUBS_PARAM = "distill.top.hubs";
+    /** Priority boost added to promoted hub-neighbour URLs. */
+    public static final String DISTILL_BOOST_PARAM = "distill.boost";
+
+    public static final boolean DEFAULT_DISTILL_ENABLED = false;
+    /** Engineering default (the paper mandates no universal interval). */
+    public static final int DEFAULT_DISTILL_INTERVAL_SECS = 120;
+    public static final int DEFAULT_DISTILL_TOP_HUBS = 10;
+    public static final double DEFAULT_DISTILL_BOOST = 1000.0;
+
+    // ---- QT5-Small quality scorer (optional; connects to the local Python service) ----
+
+    /** Enable QT5 scoring (default false so the crawler works without the Python service). */
+    public static final String QT5_ENABLED_PARAM = "qt5.enabled";
+    /** Base URL of the local scoring service. */
+    public static final String QT5_URL_PARAM = "qt5.service.url";
+    /** Per-request timeout in milliseconds. */
+    public static final String QT5_TIMEOUT_MS_PARAM = "qt5.timeout.ms";
+    /** Max characters of page text sent to the scorer (the model truncates further). */
+    public static final String QT5_MAX_CHARS_PARAM = "qt5.max.chars";
+
+    public static final boolean DEFAULT_QT5_ENABLED = false;
+    public static final String DEFAULT_QT5_URL = "http://127.0.0.1:8077";
+    public static final int DEFAULT_QT5_TIMEOUT_MS = 5000;
+    public static final int DEFAULT_QT5_MAX_CHARS = 20000;
+
     // ---- Seed ingestion ----
 
     /** Directory containing the seed file (FileSpout takes dir + file). */

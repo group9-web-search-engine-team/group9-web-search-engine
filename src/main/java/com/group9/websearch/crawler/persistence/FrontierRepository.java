@@ -80,22 +80,78 @@ public final class FrontierRepository {
     private static final String SELECT_DOC_ID_SQL =
             "SELECT doc_id FROM documents WHERE url = ?";
 
+    // documents.quality_score: set the QT5-Small page-quality score for an existing
+    // document, keyed on the unique url. Idempotent UPDATE (reruns overwrite the same row
+    // with the same value), so retries never create inconsistent / duplicate records. This
+    // column already exists in the live schema; no migration is required. The QT5 score is
+    // kept DISTINCT from pagerank (and any future QMax) -- those are separate columns.
+    private static final String UPDATE_QUALITY_SCORE_SQL =
+            "UPDATE documents SET quality_score = ? WHERE url = ?";
+
+    // ---- QMax propagation --------------------------------------------------------------
+    // QMax(u) = max(Q(p)) over all known parent pages p that link to u and have a QT5
+    // quality_score. Q(p) is a log-probability (<= 0, higher/closer-to-zero = better), so
+    // MAX is the correct aggregation (we never reverse the ordering).
+    //
+    // Recompute-from-scratch is the key to correctness: it is naturally idempotent and
+    // handles multiple parents, duplicate links, retries, and "a higher-scoring parent was
+    // discovered" with no special cases -- it always yields the true current maximum.
+
+    // For a single destination URL: the max parent quality_score across all known parents.
+    // Parents are documents that are the SOURCE of a links edge whose destination_url = ?.
+    private static final String SELECT_QMAX_FOR_DEST_SQL =
+            "SELECT max(d.quality_score) "
+            + "FROM links l JOIN documents d ON d.doc_id = l.source_doc_id "
+            + "WHERE l.destination_url = ? AND d.quality_score IS NOT NULL";
+
+    // Persist QMax onto the destination's documents row (if the row exists yet).
+    private static final String UPDATE_DEST_QMAX_SQL =
+            "UPDATE documents SET qmax_score = ? WHERE url = ?";
+
+    // Reflect QMax into the frontier priority so the claim query (ORDER BY priority DESC)
+    // actually fetches higher-QMax URLs first. Only pending/in-progress rows are updated;
+    // terminal rows are left alone. Idempotent.
+    private static final String UPDATE_FRONTIER_PRIORITY_SQL =
+            "UPDATE crawl_state SET priority = ? WHERE url = ? AND state IN ('"
+            + STATE_PENDING + "','" + STATE_IN_PROGRESS + "')";
+
+    // All distinct destination URLs linked FROM a given source page.
+    private static final String SELECT_DESTS_OF_SOURCE_SQL =
+            "SELECT DISTINCT l.destination_url "
+            + "FROM links l JOIN documents d ON d.doc_id = l.source_doc_id "
+            + "WHERE d.url = ?";
+
     // crawl_state: atomically claim up to N pending URLs that are due (next_attempt null or
     // in the past), flipping them to in_progress so no other worker / later poll re-emits
     // them. FOR UPDATE SKIP LOCKED makes concurrent claims safe; the CTE updates exactly the
     // selected rows and returns the claimed URLs. This is what prevents infinite recrawl:
     // a URL leaves 'pending' the moment it is claimed and only returns via an explicit retry.
+    //
+    // SOFT FOCUS ordering (Chakrabarti, van den Berg & Dom, 1999): "(numtries ASC, R DESC)".
+    //   * numtries   = attempt_count (total fetch attempts; incremented here, once per claim)
+    //   * R          = relevance = priority + distill_boost
+    //       - priority is our QMax-based relevance signal
+    //       - distill_boost is the separate hub-neighbour promotion (never erased by a QMax
+    //         priority update) that improves the relevance term ONLY.
+    // Because attempt_count leads the ORDER BY, a distillation boost can raise a URL within
+    // its attempt tier but can NEVER let a higher-attempt URL overtake a lower-attempt one.
+    // Deterministic tie-break: next_attempt NULLS FIRST, then url.
+    //
+    // Claiming also increments attempt_count (one fetch attempt begins per claim), so
+    // successful and failed fetches are counted exactly once without double-counting.
     private static final String CLAIM_PENDING_SQL =
             "WITH due AS ( "
             + "  SELECT url FROM crawl_state "
             + "  WHERE state = '" + STATE_PENDING + "' "
             + "    AND (next_attempt IS NULL OR next_attempt <= now()) "
-            + "  ORDER BY priority DESC, next_attempt NULLS FIRST, url "
+            + "  ORDER BY attempt_count ASC, (priority + distill_boost) DESC, "
+            + "           next_attempt NULLS FIRST, url "
             + "  LIMIT ? "
             + "  FOR UPDATE SKIP LOCKED "
             + ") "
             + "UPDATE crawl_state cs "
-            + "SET state = '" + STATE_IN_PROGRESS + "', last_attempt = now() "
+            + "SET state = '" + STATE_IN_PROGRESS + "', last_attempt = now(), "
+            + "    attempt_count = cs.attempt_count + 1 "
             + "FROM due "
             + "WHERE cs.url = due.url "
             + "RETURNING cs.url";
@@ -117,6 +173,25 @@ public final class FrontierRepository {
     private static final String RECOVER_IN_PROGRESS_SQL =
             "UPDATE crawl_state SET state = '" + STATE_PENDING + "', next_attempt = NULL "
             + "WHERE state = '" + STATE_IN_PROGRESS + "'";
+
+    // ---- Distillation graph access -----------------------------------------------------
+    // Load the directed link graph keyed by URL: (sourceUrl, destinationUrl). Uses
+    // destination_url so edges to not-yet-fetched destinations (nullable destination_doc_id)
+    // are included. Source is a fetched document (it is the source of a links row).
+    private static final String SELECT_LINK_EDGES_SQL =
+            "SELECT s.url AS src_url, l.destination_url AS dst_url "
+            + "FROM links l JOIN documents s ON s.doc_id = l.source_doc_id";
+
+    // Per-document QT5 quality (for relevance weighting in distillation).
+    private static final String SELECT_DOC_QUALITY_SQL =
+            "SELECT url, quality_score FROM documents";
+
+    // Raise a destination URL's distillation boost, but ONLY while it is still eligible to
+    // crawl (pending) and has NOT been fetched yet (unvisited). GREATEST keeps the highest
+    // boost seen so repeated runs are idempotent (no unbounded growth, no duplicate rows).
+    private static final String PROMOTE_HUB_NEIGHBOUR_SQL =
+            "UPDATE crawl_state SET distill_boost = GREATEST(distill_boost, ?) "
+            + "WHERE url = ? AND state = '" + STATE_PENDING + "'";
 
     /**
      * Insert a discovered URL into the frontier in the {@code pending} state. Returns true
@@ -179,6 +254,145 @@ public final class FrontierRepository {
                 }
                 throw new SQLException("upsertDocument returned no doc_id for url=" + doc.url());
             }
+        }
+    }
+
+    /**
+     * Set the QT5-Small page-quality score on an existing {@code documents} row (keyed on
+     * the unique {@code url}). Idempotent: a rerun overwrites the same row with the same
+     * value, so retries do not create inconsistent records. Kept distinct from
+     * {@code pagerank} / future QMax signals.
+     *
+     * @return true if a document row was updated, false if no row matched the url yet
+     */
+    public boolean updateQualityScore(String url, double qualityScore) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(UPDATE_QUALITY_SCORE_SQL)) {
+            ps.setDouble(1, qualityScore);
+            ps.setString(2, url);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    /**
+     * Compute QMax for a destination URL: the maximum QT5 {@code quality_score} across all
+     * known parent documents that link to it. Returns empty if no parent has a score yet
+     * (newly discovered URL / missing parent scores) -- the caller then leaves the default
+     * priority in place rather than forcing a value.
+     */
+    public java.util.OptionalDouble computeQMax(String destinationUrl) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(SELECT_QMAX_FOR_DEST_SQL)) {
+            ps.setString(1, destinationUrl);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    double v = rs.getDouble(1);
+                    if (!rs.wasNull()) {
+                        return java.util.OptionalDouble.of(v);
+                    }
+                }
+                return java.util.OptionalDouble.empty();
+            }
+        }
+    }
+
+    /**
+     * Recompute QMax for a single destination URL from scratch and persist it:
+     * <ul>
+     *   <li>write {@code documents.qmax_score} (if a documents row exists for the dest),</li>
+     *   <li>reflect QMax into {@code crawl_state.priority} so the frontier claim query
+     *       (ORDER BY priority DESC) fetches higher-QMax URLs first.</li>
+     * </ul>
+     * Recompute-from-scratch makes this idempotent and monotonic-safe: discovering a
+     * lower-scoring parent never lowers QMax (MAX ignores it); discovering a higher-scoring
+     * parent raises it. If no parent has a score yet, nothing is changed (safe default
+     * priority is preserved). Returns the QMax applied, or empty if none was available.
+     */
+    public java.util.OptionalDouble recomputeQMaxForDestination(String destinationUrl) throws SQLException {
+        java.util.OptionalDouble qmax = computeQMax(destinationUrl);
+        if (qmax.isEmpty()) {
+            return qmax;
+        }
+        double value = qmax.getAsDouble();
+        try (PreparedStatement ps = connection.prepareStatement(UPDATE_DEST_QMAX_SQL)) {
+            ps.setDouble(1, value);
+            ps.setString(2, destinationUrl);
+            ps.executeUpdate();
+        }
+        try (PreparedStatement ps = connection.prepareStatement(UPDATE_FRONTIER_PRIORITY_SQL)) {
+            ps.setDouble(1, value);
+            ps.setString(2, destinationUrl);
+            ps.executeUpdate();
+        }
+        return qmax;
+    }
+
+    /**
+     * Propagate a (just-scored) source page's quality to every URL it links to: recompute
+     * QMax for each distinct destination of {@code sourceUrl}. This is the propagation
+     * entry point invoked when a page's QT5 score becomes available.
+     *
+     * @return the number of destination URLs whose QMax was (re)applied
+     */
+    public int recomputeQMaxForChildrenOf(String sourceUrl) throws SQLException {
+        java.util.List<String> dests = new java.util.ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(SELECT_DESTS_OF_SOURCE_SQL)) {
+            ps.setString(1, sourceUrl);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    dests.add(rs.getString(1));
+                }
+            }
+        }
+        int applied = 0;
+        for (String dest : dests) {
+            if (recomputeQMaxForDestination(dest).isPresent()) {
+                applied++;
+            }
+        }
+        return applied;
+    }
+
+    // ---- Distillation support ----------------------------------------------------------
+
+    /** A directed edge in the crawl web graph, keyed by URL (destination may be unfetched). */
+    public record LinkEdge(String sourceUrl, String destinationUrl) {}
+
+    /** Load all directed link edges (sourceUrl -> destinationUrl) from the web graph. */
+    public java.util.List<LinkEdge> loadLinkEdges() throws SQLException {
+        java.util.List<LinkEdge> edges = new java.util.ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(SELECT_LINK_EDGES_SQL);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                edges.add(new LinkEdge(rs.getString("src_url"), rs.getString("dst_url")));
+            }
+        }
+        return edges;
+    }
+
+    /** Load per-URL QT5 quality scores (url -> quality_score) for documents that have one. */
+    public java.util.Map<String, Double> loadDocumentQuality() throws SQLException {
+        java.util.Map<String, Double> q = new java.util.HashMap<>();
+        try (PreparedStatement ps = connection.prepareStatement(SELECT_DOC_QUALITY_SQL);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                double v = rs.getDouble("quality_score");
+                if (!rs.wasNull()) {
+                    q.put(rs.getString("url"), v);
+                }
+            }
+        }
+        return q;
+    }
+
+    /**
+     * Promote a hub-neighbour URL by raising its distillation boost, but only while it is
+     * still {@code pending} (eligible and unvisited). Uses GREATEST so repeated distillation
+     * runs are idempotent. Returns true if a pending row was promoted.
+     */
+    public boolean promoteHubNeighbour(String url, double boost) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(PROMOTE_HUB_NEIGHBOUR_SQL)) {
+            ps.setDouble(1, boost);
+            ps.setString(2, url);
+            return ps.executeUpdate() > 0;
         }
     }
 
