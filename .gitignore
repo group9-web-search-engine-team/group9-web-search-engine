@@ -1,0 +1,33 @@
+﻿# Java / Maven build output
+target/
+*.class
+
+# Local datasets and generated crawl data
+datasets/
+data/
+corpus.jsonl
+queries.jsonl
+qrels/
+*.war
+
+# Credentials and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+.aws/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Local test / property-based testing state
+.jqwik-database
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

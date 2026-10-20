@@ -1,0 +1,98 @@
+# Group 9 crawler SMOKE-TEST configuration.
+#
+# Self-contained override for short end-to-end tests. Run with:
+#   java -jar target/crawler-mvp.jar -conf config/crawler-conf-smoke.yaml -local -ttl 150
+#
+# It is identical to config/crawler-conf.yaml EXCEPT:
+#   - seed.file is smoke-seeds.txt (3 crawl-friendly URLs) instead of the 53.7k BEIR list
+#   - crawl.max.seeds is set to 3 so the seed spout emits only the smoke seeds
+#
+# This file is self-contained (not merged with crawler-conf.yaml) because StormCrawler's
+# -conf loads exactly the named file on top of crawler-default.yaml.
+#
+# SECRETS ARE NEVER STORED HERE (PostgreSQL password via env var; AWS via default chain).
+
+config:
+  # ---------------- Identifiable, polite User-Agent (RFC 9309 compliant name) ----------------
+  http.agent.name: "GroupNineWebSearchCrawler"
+  http.agent.version: "0.1"
+  http.agent.description: "University IR project crawler (Group 9). Bounded, polite, educational."
+
+  # ---------------- Conservative politeness & budgets ----------------
+  fetcher.server.delay: 2.0
+  fetcher.threads.per.queue: 1
+  fetcher.threads.number: 5
+  fetcher.queue.mode: "byHost"
+  partition.url.mode: "byHost"
+  fetcher.max.crawl.delay: 30
+  fetcher.max.crawl.delay.force: false
+  fetcher.server.delay.force: false
+
+  # ---------------- Response size / timeout caps ----------------
+  http.content.limit: 10485760
+  http.timeout: 15000
+  http.store.headers: true
+  http.content.partial.as.trimmed: true
+
+  # ---------------- Robots.txt handling (safe defaults) ----------------
+  http.robots.file.skip: false
+  http.robots.headers.skip: false
+  http.robots.meta.skip: false
+  http.robots.403.allow: true
+  http.robots.5xx.allow: false
+  robots.noFollow.strict: true
+
+  # ---------------- Redirects ----------------
+  http.allow.redirects: false
+
+  # ---------------- Only HTTP/HTTPS protocols ----------------
+  protocols: "http,https"
+  http.protocol.implementation: "org.apache.stormcrawler.protocol.httpclient.HttpProtocol"
+  https.protocol.implementation: "org.apache.stormcrawler.protocol.httpclient.HttpProtocol"
+
+  # ---------------- Parsing / link extraction ----------------
+  parser.emitOutlinks: true
+  parser.emitOutlinks.max.per.page: 50
+  track.anchors: true
+  detect.mimetype: true
+  jsoup.treat.non.html.as.error: true
+
+  metadata.track.depth: true
+  metadata.track.path: true
+  metadata.transfer:
+    - parent.url
+  metadata.persist:
+    - _redirTo
+    - error.cause
+    - error.source
+    - depth
+    - parent.url
+
+  # ---------------- Frontier scheduling ----------------
+  scheduler.class: "org.apache.stormcrawler.persistence.DefaultScheduler"
+  fetchInterval.default: 1440
+  fetchInterval.fetch.error: 120
+  fetchInterval.error: -1
+  max.fetch.errors: 3
+
+  urlfilters.config.file: "urlfilters.json"
+
+  # ---------------- Group 9 custom keys (SMOKE-TEST values) ----------------
+  seed.dir: "config"
+  seed.file: "smoke-seeds.txt"
+
+  postgres.jdbc.url: "jdbc:postgresql://localhost:5432/websearch"
+  postgres.user: "websearch_crawler"
+  postgres.password.env: "WEBSEARCH_PG_PASSWORD"
+
+  s3.bucket: "web-search-engine-group9-2026-corp"
+  s3.raw.prefix: "crawl/raw/smoke-test/"
+  s3.region: "us-east-1"
+
+  # Short smoke test: emit only the 3 smoke seeds (discovered links still flow via frontier).
+  crawl.max.seeds: 3
+
+  # ---------------- Storm runtime ----------------
+  topology.workers: 1
+  topology.message.timeout.secs: 120
+  topology.max.spout.pending: 5

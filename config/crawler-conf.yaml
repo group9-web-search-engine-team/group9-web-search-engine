@@ -1,0 +1,130 @@
+# Group 9 crawler configuration (overrides for Apache StormCrawler crawler-default.yaml).
+# Pass with:  -conf config/crawler-conf.yaml
+#
+# Only keys that differ from StormCrawler defaults, plus the Group 9 custom keys, are set
+# here. Every key below is a real StormCrawler 3.1.0 configuration key (verified against
+# the bundled crawler-default.yaml) or a Group 9 key read by our own bolts.
+#
+# SECRETS ARE NEVER STORED HERE:
+#   - PostgreSQL password is read from the environment variable named by
+#     postgres.password.env (default WEBSEARCH_PG_PASSWORD).
+#   - AWS credentials come from the AWS default credential provider chain.
+
+config:
+  # ---------------- Identifiable, polite User-Agent (RFC 9309 compliant name) ----------------
+  # NOTE: StormCrawler's RobotRulesParser requires the agent NAME token to contain only
+  # letters, underscores and hyphens (NO digits), per RFC 9309 section 2.2.1. So the name
+  # must not contain "9". The human-readable description below can still identify Group 9.
+  http.agent.name: "GroupNineWebSearchCrawler"
+  http.agent.version: "0.1"
+  http.agent.description: "University IR project crawler (Group 9). Bounded, polite, educational."
+  # http.agent.url / http.agent.email intentionally omitted: no real public contact URL or
+  # mailbox is available for this university project, and inventing one would be misleading
+  # to crawled sites. Add them here if/when a genuine contact is published.
+
+  # ---------------- Conservative politeness & budgets ----------------
+  # At least 2 seconds between successive requests to the same host.
+  fetcher.server.delay: 2.0
+  # One worker thread per host queue => effectively per-host concurrency of 1 (conservative).
+  fetcher.threads.per.queue: 1
+  fetcher.threads.number: 5
+  fetcher.queue.mode: "byHost"
+  partition.url.mode: "byHost"
+  # Cap the crawl-delay we will honor from robots.txt; never become more aggressive than asked.
+  fetcher.max.crawl.delay: 30
+  fetcher.max.crawl.delay.force: false
+  fetcher.server.delay.force: false
+
+  # ---------------- Response size / timeout caps ----------------
+  # 10 MiB streamed response cap; -1 in defaults means unlimited, so we set an explicit cap.
+  http.content.limit: 10485760
+  http.timeout: 15000
+  http.store.headers: true
+  http.content.partial.as.trimmed: true
+
+  # ---------------- Robots.txt handling (safe defaults) ----------------
+  http.robots.file.skip: false
+  http.robots.headers.skip: false
+  http.robots.meta.skip: false
+  # If robots.txt returns 403 treat as allow; if 5xx do NOT blanket-allow (conservative).
+  http.robots.403.allow: true
+  http.robots.5xx.allow: false
+  robots.noFollow.strict: true
+
+  # ---------------- Redirects (disabled by default; safety filter revalidation is a later stage) ----------------
+  http.allow.redirects: false
+
+  # ---------------- Only HTTP/HTTPS protocols (no file:) ----------------
+  protocols: "http,https"
+  http.protocol.implementation: "org.apache.stormcrawler.protocol.httpclient.HttpProtocol"
+  https.protocol.implementation: "org.apache.stormcrawler.protocol.httpclient.HttpProtocol"
+
+  # ---------------- Parsing / link extraction ----------------
+  parser.emitOutlinks: true
+  # Bound fan-out per page so a single hub cannot flood the frontier.
+  parser.emitOutlinks.max.per.page: 50
+  track.anchors: true
+  detect.mimetype: true
+  jsoup.treat.non.html.as.error: true
+
+  # Track depth and path so budgets/depth filters work and parent info propagates to outlinks.
+  metadata.track.depth: true
+  metadata.track.path: true
+  metadata.transfer:
+    - parent.url
+  metadata.persist:
+    - _redirTo
+    - error.cause
+    - error.source
+    - depth
+    - parent.url
+
+  # ---------------- Frontier scheduling ----------------
+  scheduler.class: "org.apache.stormcrawler.persistence.DefaultScheduler"
+  # Do not refetch within a day; keeps repeat runs from re-crawling fetched pages.
+  fetchInterval.default: 1440
+  fetchInterval.fetch.error: 120
+  fetchInterval.error: -1
+  max.fetch.errors: 3
+
+  # URL filters/normalizers (native StormCrawler). File is optional; see config/urlfilters.json.
+  urlfilters.config.file: "urlfilters.json"
+
+  # ---------------- Group 9 custom keys (read by our bolts/runner) ----------------
+  # Seed source (local file; never the S3 seed object). NORMAL crawling uses the
+  # BEIR-derived dataset (beir-seed-urls.txt, ~53.7k URLs extracted from BEIR TREC-COVID).
+  # Boundedness comes from the finite seed file, the depth-1 MaxDepthFilter, robots rules
+  # and DB dedup — not from an artificial page cap.
+  #
+  # For a SHORT end-to-end smoke test, run with the smoke override config instead:
+  #   -conf config/crawler-conf-smoke.yaml
+  # which switches seed.file to smoke-seeds.txt (3 URLs) and sets crawl.max.seeds.
+  seed.dir: "config"
+  seed.file: "beir-seed-urls.txt"
+
+  # PostgreSQL target. Use the dedicated, NON-superuser role websearch_crawler.
+  # The password is resolved from the named env var at runtime (never stored here).
+  postgres.jdbc.url: "jdbc:postgresql://localhost:5432/websearch"
+  postgres.user: "websearch_crawler"
+  postgres.password.env: "WEBSEARCH_PG_PASSWORD"
+
+  # S3 raw-HTML storage. ISOLATED smoke-test prefix so existing seed/test objects are
+  # never overwritten. Upload uses the AWS SDK v2 default credential provider chain.
+  s3.bucket: "web-search-engine-group9-2026-corp"
+  s3.raw.prefix: "crawl/raw/smoke-test/"
+  # Region MUST be set to the bucket's region (HeadBucket/GetBucketLocation are denied for
+  # the group9-crawler identity, so the region cannot be auto-discovered). Adjust if needed.
+  s3.region: "us-east-1"
+
+  # ---------------- Optional seed emit cap (OFF by default) ----------------
+  # crawl.max.seeds caps how many SEED tuples BoundedFileSpout emits. Leave unset (or <= 0)
+  # for normal runs so ALL seeds are crawled. Set a small positive value ONLY for a very
+  # short smoke test, e.g.:
+  #   crawl.max.seeds: 3
+  # (Not set here: normal execution has no artificial seed/page cap.)
+
+  # ---------------- Storm runtime (bounded local run) ----------------
+  topology.workers: 1
+  # 2-minute tuple timeout for the bounded smoke crawl.
+  topology.message.timeout.secs: 120
+  topology.max.spout.pending: 5
