@@ -108,10 +108,11 @@ config:
   postgres.user: "websearch_crawler"
   postgres.password.env: "WEBSEARCH_PG_PASSWORD"
 
-  # S3 raw-HTML storage. ISOLATED smoke-test prefix so existing seed/test objects are
-  # never overwritten. Upload uses the AWS SDK v2 default credential provider chain.
+  # S3 raw-HTML storage. Dedicated trec-covid prefix so the benchmark crawl's raw HTML is
+  # isolated from the earlier smoke-test objects. Upload uses the AWS SDK v2 default
+  # credential provider chain.
   s3.bucket: "web-search-engine-group9-2026-corp"
-  s3.raw.prefix: "crawl/raw/smoke-test/"
+  s3.raw.prefix: "crawl/raw/trec-covid/"
   # Region MUST be set to the bucket's region (HeadBucket/GetBucketLocation are denied for
   # the group9-crawler identity, so the region cannot be auto-discovered). Adjust if needed.
   s3.region: "us-east-1"
@@ -139,13 +140,10 @@ config:
   distill.top.hubs: 10
   distill.boost: 1000.0
 
-  # ---------------- Optional seed emit cap (OFF by default) ----------------
-  # crawl.max.seeds caps how many SEED tuples BoundedFileSpout emits. Leave unset (or <= 0)
-  # for normal runs so ALL seeds are crawled. Set a small positive value ONLY for a very
-  # short smoke test, e.g.:
-  #   crawl.max.seeds: 3
-  # (Not set here: normal execution has no artificial seed/page cap.)
-
+  # ---------------- Seed emission cap ----------------
+  # Limit the number of seed tuples emitted by BoundedFileSpout. Raised to cover the full
+  # TREC-COVID seed list (~53,684 URLs); lower it again for a short smoke run.
+  crawl.max.seeds: 60000
   # ---------------- Storm runtime (bounded local run) ----------------
   topology.workers: 1
   # 2-minute tuple timeout for the bounded smoke crawl.

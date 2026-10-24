@@ -43,3 +43,24 @@ hf_cache/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Generated indexes, build output, and local datasets
+/target/
+/index-local/
+/index-local-10k/
+/week3-export/
+/data/
+/eval/*.csv
+/eval/*.json
+__pycache__/
+*.pyc
+
+# Local diagnostics and temporary files
+*_thread-dump.txt
+bi*.txt
+t_*.txt
+_val.txt
+cp.txt
+cat
+ls
+wc

@@ -27,6 +27,17 @@
         <stormcrawler.version>3.1.0</stormcrawler.version>
         <!-- StormCrawler 3.1.0 pins storm-client to 2.6.4 in its parent POM; match it. -->
         <storm.version>2.6.4</storm.version>
+        <!--
+          Week 3 distributed SPIMI indexer. Matches the Hadoop 3.5.0 runtime installed in
+          WSL2 exactly (verified against Maven Central). Hadoop jars are 'provided' scope:
+          they are needed to compile the MapReduce classes but the Hadoop/YARN runtime
+          supplies them at execution time, so they are NOT bundled into the indexer jar.
+        -->
+        <hadoop.version>3.5.0</hadoop.version>
+        <!-- jsoup is used by the exporter for HTML text extraction. Was transitive via
+             StormCrawler; pin it explicitly so the indexer artifact (which does not depend
+             on StormCrawler) still has it. -->
+        <jsoup.version>1.18.1</jsoup.version>
         <aws.sdk.version>2.28.29</aws.sdk.version>
         <postgresql.version>42.7.4</postgresql.version>
         <jackson.version>2.18.2</jackson.version>
@@ -81,7 +92,23 @@
             <version>${postgresql.version}</version>
         </dependency>
 
-        <!-- JSON config / jsoup HTML parsing comes transitively from StormCrawler -->
+        <!-- jsoup HTML parsing. Explicit (was transitive via StormCrawler) so the exporter
+             and the standalone indexer artifact both resolve it deterministically. -->
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>${jsoup.version}</version>
+        </dependency>
+
+        <!-- ===== Week 3 Hadoop MapReduce (provided: supplied by the YARN runtime) ===== -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-client</artifactId>
+            <version>${hadoop.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- JSON config / jackson -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
@@ -136,6 +163,14 @@
             <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- Lets MapReduce mapper/reducer logic run in-process via the LocalJobRunner for
+             tests (no live YARN cluster needed). Test scope only. -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-mapreduce-client-jobclient</artifactId>
+            <version>${hadoop.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -171,6 +206,7 @@
                 <version>3.6.0</version>
                 <executions>
                     <execution>
+                        <id>crawler-shade</id>
                         <phase>package</phase>
                         <goals><goal>shade</goal></goals>
                         <configuration>
@@ -197,4 +233,251 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+          Week 3 indexer artifact. Activate with:  .\mvnw.cmd -Pindexer clean package
+          This adds a SECOND shade execution that produces target/indexer.jar with mainClass
+          IndexerCli. It is additive: the default crawler shade (crawler-mvp.jar) is untouched,
+          so the crawler remains independently buildable and runnable.
+
+          Hadoop classes are 'provided', so they are deliberately NOT bundled; the jar is run
+          with `hadoop jar` / `yarn jar`, which supply the Hadoop runtime on the classpath.
+          AWS SDK, jackson, postgres, jsoup, slf4j ARE bundled (the exporter needs them and
+          Hadoop does not provide them).
+        -->
+        <profile>
+            <id>indexer</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-shade-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <executions>
+                            <!--
+                              Skip the crawler fat-jar shade during an indexer build so the
+                              indexer execution shades the plain compiled jar (not the 170MB
+                              crawler uber-jar). The crawler-shade config is left intact; it
+                              simply does not run under -Pindexer. A normal `mvn package`
+                              (no profile) still produces crawler-mvp.jar unchanged.
+                            -->
+                            <execution>
+                                <id>crawler-shade</id>
+                                <phase>none</phase>
+                            </execution>
+                            <execution>
+                                <id>indexer-shade</id>
+                                <phase>package</phase>
+                                <goals><goal>shade</goal></goals>
+                                <configuration>
+                                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                                    <!-- Produce target/indexer.jar (the crawler shade is
+                                         skipped under this profile, so nothing is overwritten). -->
+                                    <finalName>indexer</finalName>
+                                    <transformers>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                            <mainClass>com.group9.websearch.index.IndexerCli</mainClass>
+                                        </transformer>
+                                    </transformers>
+                                    <artifactSet>
+                                        <!--
+                                          The indexer only needs the exporter + MapReduce job
+                                          dependencies (AWS S3, jackson, postgres, jsoup, slf4j
+                                          and their transitive deps). Storm, StormCrawler,
+                                          Selenium, Tika etc. belong only to the crawler and
+                                          must NOT be bundled here (they would bloat the jar to
+                                          ~170MB and clash with the Hadoop runtime classpath).
+                                          Hadoop itself is 'provided' so it is excluded anyway.
+                                        -->
+                                        <excludes>
+                                            <exclude>org.apache.storm:*</exclude>
+                                            <exclude>org.apache.stormcrawler:*</exclude>
+                                            <exclude>org.seleniumhq.selenium:*</exclude>
+                                            <exclude>org.apache.tika:*</exclude>
+                                            <exclude>com.rometools:*</exclude>
+                                            <exclude>xerces:*</exclude>
+                                            <exclude>com.github.crawler-commons:*</exclude>
+                                            <exclude>io.dropwizard.metrics:*</exclude>
+                                            <exclude>com.esotericsoftware:*</exclude>
+                                            <exclude>io.netty:*</exclude>
+                                            <exclude>io.opentelemetry:*</exclude>
+                                            <!--
+                                              Logging: the Hadoop/YARN runtime supplies its own
+                                              SLF4J binding (reload4j). Bundling logback-classic
+                                              AND the log4j-over-slf4j bridge causes SLF4J's
+                                              log4j delegation loop (StackOverflowError) in the
+                                              YARN container. Exclude them; keep only slf4j-api
+                                              (also provided by Hadoop, harmless if duplicated).
+                                            -->
+                                            <exclude>ch.qos.logback:*</exclude>
+                                            <exclude>org.slf4j:log4j-over-slf4j</exclude>
+                                            <exclude>org.slf4j:slf4j-api</exclude>
+                                            <!-- log4j2 + its SLF4J binding (StaticLoggerBinder,
+                                                 Log4jLoggerFactory) also conflict with Hadoop's
+                                                 reload4j binding; drop the whole log4j2 family. -->
+                                            <exclude>org.apache.logging.log4j:*</exclude>
+                                        </excludes>
+                                    </artifactSet>
+                                    <filters>
+                                        <filter>
+                                            <artifact>*:*</artifact>
+                                            <excludes>
+                                                <exclude>META-INF/*.SF</exclude>
+                                                <exclude>META-INF/*.DSA</exclude>
+                                                <exclude>META-INF/*.RSA</exclude>
+                                                <!-- Logging config/bindings belong to the
+                                                     crawler, not the Hadoop-hosted indexer.
+                                                     Keeping logback.xml or any org/slf4j/impl
+                                                     binding reintroduces the SLF4J conflict in
+                                                     the YARN container. -->
+                                                <exclude>logback.xml</exclude>
+                                                <exclude>logback-*.xml</exclude>
+                                                <exclude>org/slf4j/impl/**</exclude>
+                                                <exclude>org/apache/logging/slf4j/**</exclude>
+                                            </excludes>
+                                        </filter>
+                                    </filters>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>search</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-shade-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <executions>
+                            <execution>
+                                <id>crawler-shade</id>
+                                <phase>none</phase>
+                            </execution>
+                            <execution>
+                                <id>search-shade</id>
+                                <phase>package</phase>
+                                <goals><goal>shade</goal></goals>
+                                <configuration>
+                                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                                    <finalName>search</finalName>
+                                    <transformers>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                            <mainClass>com.group9.websearch.search.SearchCli</mainClass>
+                                        </transformer>
+                                    </transformers>
+                                    <artifactSet>
+                                        <excludes>
+                                            <exclude>org.apache.storm:*</exclude>
+                                            <exclude>org.apache.stormcrawler:*</exclude>
+                                            <exclude>org.seleniumhq.selenium:*</exclude>
+                                            <exclude>org.apache.tika:*</exclude>
+                                            <exclude>com.rometools:*</exclude>
+                                            <exclude>xerces:*</exclude>
+                                            <exclude>com.github.crawler-commons:*</exclude>
+                                            <exclude>io.dropwizard.metrics:*</exclude>
+                                            <exclude>com.esotericsoftware:*</exclude>
+                                            <exclude>io.netty:*</exclude>
+                                            <exclude>io.opentelemetry:*</exclude>
+                                            <exclude>software.amazon.awssdk:*</exclude>
+                                            <exclude>org.apache.hadoop:*</exclude>
+                                            <exclude>org.postgresql:*</exclude>
+                                            <exclude>org.apache.logging.log4j:*</exclude>
+                                        </excludes>
+                                    </artifactSet>
+                                    <filters>
+                                        <filter>
+                                            <artifact>*:*</artifact>
+                                            <excludes>
+                                                <exclude>META-INF/*.SF</exclude>
+                                                <exclude>META-INF/*.DSA</exclude>
+                                                <exclude>META-INF/*.RSA</exclude>
+                                            </excludes>
+                                        </filter>
+                                    </filters>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!--
+          Evaluation CLI artifact. Activate with:  .\mvnw.cmd -Peval clean package
+          Produces target/eval.jar with mainClass EvalCli. Same dependency footprint as the
+          search profile (it drives the existing BM25 SearchService over a fixed index snapshot
+          and reads benchmark queries/qrels via jackson). Additive; skips the crawler fat-jar
+          shade so it shades the plain compiled jar. No Hadoop/Storm/AWS/Postgres bundled.
+        -->
+        <profile>
+            <id>eval</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-shade-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <executions>
+                            <execution>
+                                <id>crawler-shade</id>
+                                <phase>none</phase>
+                            </execution>
+                            <execution>
+                                <id>eval-shade</id>
+                                <phase>package</phase>
+                                <goals><goal>shade</goal></goals>
+                                <configuration>
+                                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                                    <finalName>eval</finalName>
+                                    <transformers>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                            <mainClass>com.group9.websearch.eval.EvalCli</mainClass>
+                                        </transformer>
+                                    </transformers>
+                                    <artifactSet>
+                                        <excludes>
+                                            <exclude>org.apache.storm:*</exclude>
+                                            <exclude>org.apache.stormcrawler:*</exclude>
+                                            <exclude>org.seleniumhq.selenium:*</exclude>
+                                            <exclude>org.apache.tika:*</exclude>
+                                            <exclude>com.rometools:*</exclude>
+                                            <exclude>xerces:*</exclude>
+                                            <exclude>com.github.crawler-commons:*</exclude>
+                                            <exclude>io.dropwizard.metrics:*</exclude>
+                                            <exclude>com.esotericsoftware:*</exclude>
+                                            <exclude>io.netty:*</exclude>
+                                            <exclude>io.opentelemetry:*</exclude>
+                                            <exclude>software.amazon.awssdk:*</exclude>
+                                            <exclude>org.apache.hadoop:*</exclude>
+                                            <exclude>org.postgresql:*</exclude>
+                                            <exclude>org.apache.logging.log4j:*</exclude>
+                                        </excludes>
+                                    </artifactSet>
+                                    <filters>
+                                        <filter>
+                                            <artifact>*:*</artifact>
+                                            <excludes>
+                                                <exclude>META-INF/*.SF</exclude>
+                                                <exclude>META-INF/*.DSA</exclude>
+                                                <exclude>META-INF/*.RSA</exclude>
+                                            </excludes>
+                                        </filter>
+                                    </filters>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

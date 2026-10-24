@@ -1,0 +1,22 @@
+{
+  "formatVersion" : "linear-ols-v1",
+  "featureNames" : [ "TITLE_MATCHES", "URL_MATCHES", "ANCHOR_MATCHES", "BODY_MATCHES", "TITLE_COVERAGE", "QUERY_COVERAGE", "BODY_TF", "PROXIMITY" ],
+  "coefficients" : [ 0.0, 0.0, 0.0, -1.9392631263512655E-14, 0.0, 2.5003619214542187E-13, 9.140680203973301E-14, -2.454461411661079E-13 ],
+  "intercept" : 0.9999999999997169,
+  "hasIntercept" : true,
+  "metadata" : {
+    "dataset" : "BEIR MS MARCO",
+    "solver" : "normal-equations-cholesky",
+    "examplesRead" : 0,
+    "examplesAccepted" : 532751,
+    "examplesSkipped" : 0,
+    "labelDistribution" : "1:532751",
+    "trainQueries" : 502939,
+    "validationQueries" : 6980,
+    "trainRmse" : 0.0,
+    "validationRmse" : 7.342305795490598E-14,
+    "validationMap" : 1.0,
+    "validationNdcg10" : 1.0,
+    "notes" : "non-informative (all-zero) feature columns: [TITLE_MATCHES, URL_MATCHES, ANCHOR_MATCHES, TITLE_COVERAGE]"
+  }
+}
