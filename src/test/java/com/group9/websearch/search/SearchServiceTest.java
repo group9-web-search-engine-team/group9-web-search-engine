@@ -68,14 +68,23 @@ class SearchServiceTest {
     }
 
     @Test
-    void orRanksTitleMatchHigher(@TempDir Path tmp) throws Exception {
+    void orRanksByBm25LengthNormalisation(@TempDir Path tmp) throws Exception {
         SearchService svc = build(tmp, new SearchConfig());
         SearchService.Response resp = svc.search("cat");
-        // doc1 (cat in title+body) and doc3 (cat in body) both match; doc1 ranks first.
+        // doc1 (cat in title+body, dl=6, tf=2) and doc3 (cat in body, dl=2, tf=1) both match.
+        //
+        // Under REAL BM25 (Bm25Ranker: field boosts are intentionally NOT part of the score),
+        // length normalisation dominates here. With N=3, df("cat")=2, k1=1.2, b=0.75,
+        // avgdl=11/3≈3.667:
+        //   doc1: lengthNorm=0.25+0.75*(6/3.667)=1.477 -> 2*2.2/(2+1.2*1.477)=4.4/3.772=1.166
+        //   doc3: lengthNorm=0.25+0.75*(2/3.667)=0.659 -> 1*2.2/(1+1.2*0.659)=2.2/1.791=1.228
+        // So the SHORTER doc3 correctly outranks doc1. The old expectation (title match ranks
+        // first) reflected a legacy field-boosted scorer and is outdated, NOT a regression.
         assertEquals(2, resp.results.size());
-        assertEquals(1L, resp.results.get(0).docId());
+        assertEquals(3L, resp.results.get(0).docId());
+        assertEquals(1L, resp.results.get(1).docId());
         assertTrue(resp.results.get(0).score() > resp.results.get(1).score());
-        assertEquals("http://x/cat", resp.results.get(0).url());
+        assertEquals("http://x/zoo", resp.results.get(0).url());
     }
 
     @Test

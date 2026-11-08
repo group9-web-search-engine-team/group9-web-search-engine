@@ -99,8 +99,11 @@ public final class Bm25Ranker {
         return new Scored(total, breakdown, details);
     }
 
-    /** IDF(t) = ln(1 + (N - df + 0.5) / (df + 0.5)); non-negative for all df in [0, N]. */
-    static double idf(int n, int df) {
+    /**
+     * IDF(t) = ln(1 + (N - df + 0.5) / (df + 0.5)); non-negative for all df in [0, N].
+     * Public so the distributed coordinator reuses the EXACT same IDF (no duplicate formula).
+     */
+    public static double idf(int n, int df) {
         double numerator = (n - df) + 0.5;
         double denominator = df + 0.5;
         return Math.log(1.0 + (numerator / denominator));

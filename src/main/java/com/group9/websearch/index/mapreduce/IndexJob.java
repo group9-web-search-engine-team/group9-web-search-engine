@@ -50,6 +50,13 @@ public final class IndexJob {
         public long spimiMaxEntries = SpimiIndexMapper.DEFAULT_MAX_ENTRIES;
         public boolean overwrite = false;
         public String jobName = DEFAULT_JOB_NAME;
+        /**
+         * When true, use the deterministic five-way {@link TermRangePartitioner}
+         * (P1 a-h, P2 i-m, P3 n-s, P4 t-z, P5 special) instead of Hadoop's default hash
+         * partitioner, and force exactly {@code TermPartitioner.NUM_PARTITIONS} reducers so each
+         * reducer owns one logical term partition. Indexing and query routing then agree.
+         */
+        public boolean rangePartition = false;
     }
 
     /**
@@ -66,6 +73,14 @@ public final class IndexJob {
         }
         if (p.numReducers < 1) {
             throw new IllegalArgumentException("numReducers must be >= 1");
+        }
+        if (p.rangePartition
+                && p.numReducers != com.group9.websearch.index.TermPartitioner.NUM_PARTITIONS) {
+            throw new IllegalArgumentException(
+                    "range partitioning requires exactly "
+                    + com.group9.websearch.index.TermPartitioner.NUM_PARTITIONS
+                    + " reducers (one per logical term partition P1..P5); got "
+                    + p.numReducers);
         }
 
         conf.setLong(SpimiIndexMapper.SPIMI_MAX_ENTRIES, p.spimiMaxEntries);
@@ -89,6 +104,12 @@ public final class IndexJob {
 
         job.setMapperClass(SpimiIndexMapper.class);
         job.setReducerClass(SpimiIndexReducer.class);
+        // Deterministic five-way term-range partitioning (shared with query routing) replaces
+        // the default hash partitioner when enabled, so the on-disk partition for a term equals
+        // the partition the coordinator routes it to.
+        if (p.rangePartition) {
+            job.setPartitionerClass(TermRangePartitioner.class);
+        }
 
         // Map output: (term, partial postings)
         job.setMapOutputKeyClass(Text.class);

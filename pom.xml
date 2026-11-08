@@ -479,5 +479,75 @@
                 </plugins>
             </build>
         </profile>
+
+        <!--
+          Distributed coordinator CLI artifact. Activate with:  .\mvnw.cmd -Pcoordinator clean package
+          Produces target/coordinator.jar with mainClass CoordinatorCli. Same lean dependency
+          footprint as the search profile (JDK HttpClient + Jackson + slf4j; NO Hadoop/Storm/AWS/
+          Postgres). Additive: it disables the crawler fat-jar shade and adds its own shade, so
+          existing profiles and shaded JARs are untouched.
+        -->
+        <profile>
+            <id>coordinator</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-shade-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <executions>
+                            <execution>
+                                <id>crawler-shade</id>
+                                <phase>none</phase>
+                            </execution>
+                            <execution>
+                                <id>coordinator-shade</id>
+                                <phase>package</phase>
+                                <goals><goal>shade</goal></goals>
+                                <configuration>
+                                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                                    <finalName>coordinator</finalName>
+                                    <transformers>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                            <mainClass>com.group9.websearch.search.cluster.CoordinatorCli</mainClass>
+                                        </transformer>
+                                    </transformers>
+                                    <artifactSet>
+                                        <excludes>
+                                            <exclude>org.apache.storm:*</exclude>
+                                            <exclude>org.apache.stormcrawler:*</exclude>
+                                            <exclude>org.seleniumhq.selenium:*</exclude>
+                                            <exclude>org.apache.tika:*</exclude>
+                                            <exclude>com.rometools:*</exclude>
+                                            <exclude>xerces:*</exclude>
+                                            <exclude>com.github.crawler-commons:*</exclude>
+                                            <exclude>io.dropwizard.metrics:*</exclude>
+                                            <exclude>com.esotericsoftware:*</exclude>
+                                            <exclude>io.netty:*</exclude>
+                                            <exclude>io.opentelemetry:*</exclude>
+                                            <exclude>software.amazon.awssdk:*</exclude>
+                                            <exclude>org.apache.hadoop:*</exclude>
+                                            <exclude>org.postgresql:*</exclude>
+                                            <exclude>org.apache.logging.log4j:*</exclude>
+                                        </excludes>
+                                    </artifactSet>
+                                    <filters>
+                                        <filter>
+                                            <artifact>*:*</artifact>
+                                            <excludes>
+                                                <exclude>META-INF/*.SF</exclude>
+                                                <exclude>META-INF/*.DSA</exclude>
+                                                <exclude>META-INF/*.RSA</exclude>
+                                            </excludes>
+                                        </filter>
+                                    </filters>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
     </profiles>
 </project>

@@ -37,23 +37,33 @@ class RetrievalMetricsTest {
     }
 
     @Test
-    void precisionShortRankingDividesByK() {
-        List<String> ranking = List.of("d1"); // only one retrieved
+    void precisionShortRankingDividesByJudgedRetrieved() {
+        List<String> ranking = List.of("d1"); // only one retrieved, and it is judged relevant
         Map<String, Integer> g = grades("d1", 1);
-        // P@10 = 1 relevant / 10 = 0.1
-        assertEquals(0.1, RetrievalMetrics.precisionAtK(ranking, g, 10, 1), EPS);
+        // Judged-only convention: P@10 = 1 relevant / min(10, 1 judged) = 1.0
+        assertEquals(1.0, RetrievalMetrics.precisionAtK(ranking, g, 10, 1), EPS);
     }
 
     // ---- Recall@k ----
 
     @Test
     void recallAtKHandCalc() {
+        // All judged docs so condensing does not change anything; d9 is relevant but not retrieved.
         List<String> ranking = List.of("d1", "d2", "d3");
-        Map<String, Integer> g = grades("d1", 1, "d3", 1, "d9", 1); // 3 relevant total
-        // top-2 retrieves d1 only among relevant -> 1/3
+        Map<String, Integer> g = grades("d1", 1, "d2", 0, "d3", 1, "d9", 1); // 3 relevant total
+        // condensed = [d1,d2,d3]; top-2 (d1,d2) retrieves d1 among relevant -> 1/3
         assertEquals(1.0 / 3.0, RetrievalMetrics.recallAtK(ranking, g, 2, 1), EPS);
-        // top-3 retrieves d1,d3 -> 2/3
+        // top-3 (d1,d2,d3) retrieves d1,d3 -> 2/3
         assertEquals(2.0 / 3.0, RetrievalMetrics.recallAtK(ranking, g, 3, 1), EPS);
+    }
+
+    @Test
+    void recallExcludesUnjudgedFromRankSlots() {
+        // d2 unjudged between two relevant judged docs; total relevant = 3 (d1,d3,d9).
+        List<String> ranking = List.of("d1", "d2", "d3");
+        Map<String, Integer> g = grades("d1", 1, "d3", 1, "d9", 1);
+        // condensed = [d1,d3]; Recall@2 = d1,d3 relevant retrieved / 3 total = 2/3.
+        assertEquals(2.0 / 3.0, RetrievalMetrics.recallAtK(ranking, g, 2, 1), EPS);
     }
 
     @Test
@@ -67,9 +77,10 @@ class RetrievalMetricsTest {
 
     @Test
     void f1AtKHarmonicMean() {
+        // d2,d4 judged non-relevant (not unjudged) so they remain as rank slots.
         List<String> ranking = List.of("d1", "d2", "d3", "d4");
-        Map<String, Integer> g = grades("d1", 1, "d3", 1); // 2 relevant total
-        // P@2 = 1/2 ; R@2 = 1/2 ; F1 = 2*.5*.5/(1) = .5
+        Map<String, Integer> g = grades("d1", 1, "d2", 0, "d3", 1, "d4", 0); // 2 relevant total
+        // condensed = [d1,d2,d3,d4]; P@2 = 1/2 ; R@2 = 1/2 ; F1 = 2*.5*.5/1 = .5
         assertEquals(0.5, RetrievalMetrics.f1AtK(ranking, g, 2, 1), EPS);
     }
 
@@ -88,12 +99,21 @@ class RetrievalMetricsTest {
 
     @Test
     void averagePrecisionHandCalc() {
-        // relevant at ranks 1 and 3 (d1,d3); total relevant = 2
-        // AP = (1/1 + 2/3) / 2 = (1 + 0.6667)/2 = 0.8333...
+        // All judged (d2,d4 non-relevant). relevant at ranks 1 and 3 (d1,d3); total relevant = 2.
+        // condensed = [d1,d2,d3,d4]; AP = (1/1 + 2/3) / 2 = 0.8333...
         List<String> ranking = List.of("d1", "d2", "d3", "d4");
-        Map<String, Integer> g = grades("d1", 1, "d3", 1);
+        Map<String, Integer> g = grades("d1", 1, "d2", 0, "d3", 1, "d4", 0);
         double ap = RetrievalMetrics.averagePrecision(ranking, g, 1);
         assertEquals((1.0 + 2.0 / 3.0) / 2.0, ap, EPS);
+    }
+
+    @Test
+    void averagePrecisionWithUnjudgedRemoved() {
+        // d2,d4 UNJUDGED (not in grades). Condensed = [d1,d3] with both relevant.
+        // AP = (1/1 + 2/2)/2 = 1.0 (unjudged docs do not depress AP).
+        List<String> ranking = List.of("d1", "d2", "d3", "d4");
+        Map<String, Integer> g = grades("d1", 1, "d3", 1);
+        assertEquals(1.0, RetrievalMetrics.averagePrecision(ranking, g, 1), EPS);
     }
 
     @Test
@@ -149,11 +169,13 @@ class RetrievalMetricsTest {
     }
 
     @Test
-    void unjudgedRetrievedDocsAreNotRelevant() {
-        // d2 is not in grades (unjudged) -> treated as not relevant, never fabricated as rel
+    void unjudgedRetrievedDocsAreExcludedNotCountedNonRelevant() {
+        // d2 is not in grades (unjudged) -> EXCLUDED from the ranking (condensed), never
+        // fabricated as relevant and never counted as a non-relevant rank slot.
         List<String> ranking = List.of("d1", "d2");
         Map<String, Integer> g = grades("d1", 1); // d2 unjudged
-        assertEquals(0.5, RetrievalMetrics.precisionAtK(ranking, g, 2, 1), EPS);
+        // Condensed ranking = [d1]; P@2 = 1 relevant / min(2, 1 judged) = 1.0
+        assertEquals(1.0, RetrievalMetrics.precisionAtK(ranking, g, 2, 1), EPS);
         assertEquals(1.0, RetrievalMetrics.recallAtK(ranking, g, 2, 1), EPS); // 1 of 1 relevant
     }
 

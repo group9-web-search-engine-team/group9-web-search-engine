@@ -57,6 +57,26 @@ public final class DocIdResolver {
         this.urlMappings = urlMappings;
     }
 
+    /**
+     * Build a resolver from the CANONICAL {@link com.group9.websearch.index.IdMap} -- the
+     * authoritative, explicit {@code beirId<->internalId} bijection. This is the preferred path:
+     * identity comes only from the explicit map, with NO title/URL/PMC guessing. The idMap's
+     * own duplicate/malformed detection has already run; a one-to-one map yields a one-to-one
+     * resolver.
+     */
+    public static DocIdResolver fromIdMap(com.group9.websearch.index.IdMap idMap) {
+        Map<String, Long> benchToOurs = new HashMap<>();
+        Map<Long, String> oursToBench = new HashMap<>();
+        for (String beir : idMap.beirIds()) {
+            long internal = idMap.toInternal(beir).orElseThrow();
+            benchToOurs.put(beir, internal);
+            oursToBench.put(internal, beir);
+        }
+        LOG.info("DocIdResolver built from canonical IdMap: {} mappings (oneToOne={})",
+                benchToOurs.size(), idMap.isOneToOne());
+        return new DocIdResolver(benchToOurs, oursToBench, benchToOurs.size(), 0);
+    }
+
     public Optional<Long> toOurDocId(String benchmarkDocId) {
         return Optional.ofNullable(benchToOurs.get(benchmarkDocId));
     }

@@ -124,11 +124,33 @@ public final class IndexerCli {
                 case "--spimi-max-entries": p.spimiMaxEntries = Long.parseLong(req(a, ++i, "--spimi-max-entries")); break;
                 case "--overwrite": p.overwrite = true; break;
                 case "--job-name": p.jobName = req(a, ++i, "--job-name"); break;
+                case "--range-partition": p.rangePartition = true; break;
                 default: throw new IllegalArgumentException("unknown index flag: " + a[i]);
             }
         }
         if (p.inputPath == null || p.outputPath == null) {
             throw new IllegalArgumentException("index requires --input and --output");
+        }
+        if (p.rangePartition) {
+            // Five-way term-range partitioning (P1 a-h, P2 i-m, P3 n-s, P4 t-z, P5 special)
+            // requires exactly five reducers so each reducer owns one logical partition and the
+            // on-disk partition matches the coordinator's query routing. If the caller left the
+            // default (1), set it to 5; if they explicitly passed a different count, reject it
+            // with an actionable message rather than silently changing it.
+            if (p.numReducers == 1) {
+                p.numReducers = com.group9.websearch.index.TermPartitioner.NUM_PARTITIONS;
+            } else if (p.numReducers != com.group9.websearch.index.TermPartitioner.NUM_PARTITIONS) {
+                throw new IllegalArgumentException(
+                        "--range-partition requires exactly "
+                        + com.group9.websearch.index.TermPartitioner.NUM_PARTITIONS
+                        + " reducers (one per logical term partition P1..P5); "
+                        + "you passed --reducers " + p.numReducers
+                        + ". Omit --reducers or set it to "
+                        + com.group9.websearch.index.TermPartitioner.NUM_PARTITIONS + ".");
+            }
+            LOG.info("Range partitioning ENABLED: 5 reducers -> P1..P5 "
+                    + "(part-r-00000=P1 a-h, 00001=P2 i-m, 00002=P3 n-s, 00003=P4 t-z, "
+                    + "00004=P5 special).");
         }
         return IndexJob.run(conf, p);
     }
@@ -264,8 +286,13 @@ public final class IndexerCli {
             + "\n"
             + "  index    --input <hdfsPath> --output <hdfsPath> [--reducers N]\n"
             + "           [--spimi-max-entries N] [--overwrite] [--job-name NAME]\n"
+            + "           [--range-partition]\n"
             + "      MapReduce SPIMI: JSONL -> term-partitioned inverted index. Run with\n"
             + "      `hadoop jar` / `yarn jar` so the Hadoop runtime is on the classpath.\n"
+            + "      --range-partition: use the deterministic five-way term-range partitioner\n"
+            + "        (P1 a-h, P2 i-m, P3 n-s, P4 t-z, P5 special) with exactly 5 reducers, so\n"
+            + "        the on-disk partitions match the coordinator's query routing. Disabled by\n"
+            + "        default (behaviour unchanged: Hadoop hash partitioner, --reducers count).\n"
             + "\n"
             + "  validate --index <hdfsPath>\n"
             + "      Checks _SUCCESS, record decodability, duplicate (term,docId), docId order.\n"

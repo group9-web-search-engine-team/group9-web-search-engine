@@ -36,6 +36,13 @@ public final class EvalCli {
     }
 
     static int run(String[] args) {
+        // Optional subcommand: verify/extract the canonical BEIR id mapping from the full corpus
+        // metadata export and persist a versioned artifact. All other invocations are the normal
+        // evaluation run (default), so existing CLI behaviour is unchanged.
+        if (args.length > 0 && args[0].equals("verify-idmap")) {
+            return MappingVerifier.run(java.util.Arrays.copyOfRange(args, 1, args.length));
+        }
+
         EvalConfig cfg = new EvalConfig();
         List<Integer> cutoffs = new ArrayList<>();
         try {
@@ -47,6 +54,11 @@ public final class EvalCli {
                     case "--index" -> cfg.indexDir = req(args, ++i, "--index");
                     case "--meta" -> cfg.metadataJsonl = req(args, ++i, "--meta");
                     case "--stats" -> cfg.statsArtifact = req(args, ++i, "--stats");
+                    case "--distributed" -> cfg.distributed = true;
+                    case "--cluster-config" -> cfg.clusterConfig = req(args, ++i, "--cluster-config");
+                    case "--coordinator" -> cfg.coordinatorAddress = req(args, ++i, "--coordinator");
+                    case "--connect-timeout" ->
+                            cfg.connectTimeoutMillis = Long.parseLong(req(args, ++i, "--connect-timeout"));
                     case "--k" -> cutoffs.add(Integer.parseInt(req(args, ++i, "--k")));
                     case "--threshold" -> cfg.relevanceThreshold = Integer.parseInt(req(args, ++i, "--threshold"));
                     case "--depth" -> cfg.retrievalDepth = Integer.parseInt(req(args, ++i, "--depth"));
@@ -69,6 +81,10 @@ public final class EvalCli {
 
         if (cfg.queriesPath == null || cfg.qrelsPath == null) {
             usage("--queries and --qrels are required");
+            return 2;
+        }
+        if (cfg.distributed && (cfg.statsArtifact == null || cfg.statsArtifact.isBlank())) {
+            usage("--distributed requires --stats <corpus-stats.json> (global BM25 statistics)");
             return 2;
         }
         if (!cutoffs.isEmpty()) {
@@ -95,6 +111,12 @@ public final class EvalCli {
 
     private static void printConsole(EvalConfig cfg, EvaluationRunner.Outcome o) {
         System.out.println("=== Retrieval evaluation (Okapi BM25) ===");
+        System.out.println("mode:                  " + (o.distributed ? "DISTRIBUTED (coordinator->workers)" : "local index"));
+        if (o.distributed) {
+            System.out.println("partitions healthy:    " + o.partitionsHealthy + "/" + o.partitionsTotal);
+            System.out.println("queries w/ partial:    " + o.queriesWithFailedPartitions
+                    + " (had failed/timed-out partitions)");
+        }
         System.out.println("index snapshot:        " + o.indexSnapshotPath);
         System.out.println("index size on disk:    " + OperationalMetrics.humanBytes(o.indexSizeBytes));
         System.out.println("indexed documents (N): " + (o.indexedDocCount < 0 ? "unavailable" : o.indexedDocCount));
@@ -150,6 +172,16 @@ public final class EvalCli {
     private static void writeJson(EvalConfig cfg, EvaluationRunner.Outcome o) throws IOException {
         ObjectNode root = MAPPER.createObjectNode();
         root.put("ranker", "okapi-bm25");
+        root.put("mode", o.distributed ? "distributed" : "local");
+        if (o.distributed) {
+            root.put("partitionsHealthy", o.partitionsHealthy);
+            root.put("partitionsTotal", o.partitionsTotal);
+            root.put("queriesWithFailedPartitions", o.queriesWithFailedPartitions);
+            root.put("clusterConfig", cfg.clusterConfig);
+            if (cfg.coordinatorAddress != null) {
+                root.put("coordinatorAddress", cfg.coordinatorAddress);
+            }
+        }
         root.put("indexSnapshot", o.indexSnapshotPath);
         root.put("indexSizeBytes", o.indexSizeBytes);
         root.put("indexedDocCount", o.indexedDocCount);
@@ -159,8 +191,42 @@ public final class EvalCli {
         root.put("queriesSkipped", o.queriesSkipped);
         root.put("judgedRelevantTotal", o.judgedRelevantTotal);
         root.put("benchmarkCoverage", o.benchmarkCoverage);
+        root.put("benchmarkCoverageScope",
+                "fraction of DISTINCT qrels docIds (in the supplied qrels) that resolve via the "
+                + "id map; NOT full-corpus coverage");
         root.put("mappedJudgedDocs", o.mappedJudgedDocs);
         root.put("totalJudgedDocs", o.totalJudgedDocs);
+        root.put("judgedDocsUnresolved", o.judgedDocsUnresolved);
+        root.put("judgedDocsOutOfSubset", o.judgedDocsOutOfSubset);
+        root.put("totalUnmappedResults", o.totalUnmappedResults);
+
+        // Reproducibility: the exact configuration that produced this report.
+        ObjectNode config = root.putObject("config");
+        config.put("queriesPath", cfg.queriesPath);
+        config.put("qrelsPath", cfg.qrelsPath);
+        config.put("idMapPath", cfg.idMapPath);
+        config.put("indexDir", cfg.indexDir);
+        config.put("metadataJsonl", cfg.metadataJsonl);
+        config.put("statsArtifact", cfg.statsArtifact);
+        config.put("relevanceThreshold", cfg.relevanceThreshold);
+        config.put("retrievalDepth", cfg.retrievalDepth);
+        ArrayNode cutoffCfg = config.putArray("cutoffs");
+        for (int kk : cfg.cutoffs) {
+            cutoffCfg.add(kk);
+        }
+        config.put("rankingPositionsPreserved", true);
+        config.put("unjudgedPolicy",
+                "judged-only (condensed list): unjudged retrieved documents (incl. unmapped "
+                + "placeholders) are REMOVED from the ranking before metrics; relative order of "
+                + "the surviving judged documents is preserved");
+        config.put("apDepth", cfg.retrievalDepth);
+        config.put("ndcgGain", "raw-grade");
+        config.put("metricConventions",
+                "computed over the judged-only condensed ranking: P@k denom=min(k, judged "
+                + "retrieved); recall denom=all judged-relevant; AP over condensed ranking / "
+                + "judged-relevant; nDCG@k over condensed ranking with IDCG from judged grades; "
+                + "zero-relevant queries -> recall/F1/AP NaN and excluded from those macro "
+                + "averages; all aggregates are MACRO averages over eligible queries");
 
         ObjectNode latency = root.putObject("queryLatencyMillis");
         latency.put("samples", o.operational.latencySampleCount());
@@ -251,23 +317,32 @@ public final class EvalCli {
             System.err.println("error: " + err);
         }
         System.err.println(
-            "Usage: EvalCli --queries <file> --qrels <file> [--idmap <tsv>] [--index DIR]\n"
+            "Usage: EvalCli --queries <file> --qrels <file> [--idmap <tsv>]\n"
+            + "               [ LOCAL:  --index DIR ]\n"
+            + "               [ DISTRIBUTED: --distributed --cluster-config FILE [--coordinator HOST] ]\n"
             + "               [--meta JSONL] [--stats JSON] [--k N]... [--threshold G]\n"
-            + "               [--depth N] [--json-out FILE] [--csv-out FILE]\n"
+            + "               [--depth N] [--connect-timeout MS] [--json-out FILE] [--csv-out FILE]\n"
             + "\n"
-            + "  --queries FILE   BEIR queries.jsonl ({_id,text}) or a 'id<TAB>text' TSV (required)\n"
-            + "  --qrels FILE     BEIR qrels TSV: query-id<TAB>corpus-id<TAB>score (required)\n"
-            + "  --idmap TSV      benchmarkDocId<TAB>ourDocId|url mapping (for id matching)\n"
-            + "  --index DIR      FIXED index snapshot directory (default: index-local)\n"
-            + "  --meta JSONL     document metadata export (default: week3-export/documents.jsonl)\n"
-            + "  --stats JSON     published BM25 stats artifact (for N in the report)\n"
-            + "  --k N            metric cutoff; repeatable (default: 10)\n"
-            + "  --threshold G    binary relevance threshold: grade >= G is relevant (default 1)\n"
-            + "  --depth N        results requested per query (default 100; >= max k)\n"
-            + "  --json-out FILE  JSON report (default: eval/report.json)\n"
-            + "  --csv-out FILE   per-query CSV (default: eval/per-query.csv)\n"
+            + "  --queries FILE       BEIR queries.jsonl ({_id,text}) or a 'id<TAB>text' TSV (required)\n"
+            + "  --qrels FILE         BEIR qrels TSV: query-id<TAB>corpus-id<TAB>score (required)\n"
+            + "  --idmap TSV          beirId<TAB>internalId mapping (required for real benchmarking)\n"
+            + "  --distributed        evaluate THROUGH the live DistributedCoordinator (HTTP fan-out\n"
+            + "                       to the 5 partition workers + global BM25); no local index loaded\n"
+            + "  --cluster-config FILE  cluster properties with worker.P1..P5 addresses (distributed)\n"
+            + "  --coordinator HOST   coordinator host annotation for the report (routing is from\n"
+            + "                       the cluster properties; optional)\n"
+            + "  --connect-timeout MS per-worker /health connect timeout in distributed mode (def 2000)\n"
+            + "  --index DIR          LOCAL mode: fixed index snapshot directory (default: index-local)\n"
+            + "  --meta JSONL         document metadata export (default: week3-export/documents.jsonl)\n"
+            + "  --stats JSON         BM25 stats artifact; REQUIRED in --distributed mode (global N/avgdl)\n"
+            + "  --k N                metric cutoff; repeatable (default: 10)\n"
+            + "  --threshold G        binary relevance threshold: grade >= G is relevant (default 1)\n"
+            + "  --depth N            results requested per query (default 100; >= max k)\n"
+            + "  --json-out FILE      JSON report (default: eval/report.json)\n"
+            + "  --csv-out FILE       per-query CSV (default: eval/per-query.csv)\n"
             + "\n"
-            + "Metrics: Precision@k, Recall@k, F1@k, MAP, NDCG@k (graded). The evaluator reads the\n"
-            + "snapshot read-only and never modifies the index or the crawler/indexer.");
+            + "Metrics: Precision@k, Recall@k, F1@k, MAP, NDCG@k (graded), macro-averaged. Distributed\n"
+            + "mode reuses the production coordinator/worker query path and the SAME global BM25; it\n"
+            + "never modifies indexes, workers, crawler, or indexer.");
     }
 }

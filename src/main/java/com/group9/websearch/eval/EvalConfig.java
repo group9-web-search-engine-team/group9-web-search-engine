@@ -24,6 +24,25 @@ public final class EvalConfig {
     /** Optional published BM25 stats artifact (for N / Lave in the report). */
     public String statsArtifact = null;
 
+    // --- Distributed mode (evaluate through the live coordinator->worker path) ---
+    /**
+     * When true, queries are executed through the existing {@code DistributedCoordinator}
+     * (HTTP fan-out to the five partition workers + global BM25), NOT a local index. No local
+     * index is loaded in this mode; {@code statsArtifact} supplies the global corpus statistics
+     * (required), and {@code clusterConfig} supplies the worker addresses.
+     */
+    public boolean distributed = false;
+    /** Path to the cluster properties (worker.P1..P5 addresses + query.timeoutMillis). */
+    public String clusterConfig = "config/cluster.properties";
+    /**
+     * Optional single coordinator/worker base host override (e.g. "44.222.139.216"). When set,
+     * it is only used to annotate the report; worker routing always comes from the cluster
+     * properties so no endpoint/protocol is invented here.
+     */
+    public String coordinatorAddress = null;
+    /** Per-worker TCP connect timeout (ms) for the distributed-mode health gate. */
+    public long connectTimeoutMillis = 2000;
+
     // --- Metric configuration ---
     /** Cutoffs to evaluate (must include 10 per the report). */
     public List<Integer> cutoffs = List.of(10);
