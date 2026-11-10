@@ -140,6 +140,68 @@ class PostgresStatusUpdaterBoltTest {
         verify(collector, times(1)).fail(t);
     }
 
+    @Test
+    void storeDiscoveredAcksTheTuple() throws Exception {
+        // ROOT-CAUSE REGRESSION: AbstractStatusUpdaterBolt.execute() does NOT ack after store();
+        // store() must ack, or the anchored spout tuple never completes and the URL is stranded
+        // in_progress. Verify store(DISCOVERED) persists AND acks.
+        OutputCollector collector = mock(OutputCollector.class);
+        FrontierRepository repo = mock(FrontierRepository.class);
+        PostgresStatusUpdaterBolt bolt = new PostgresStatusUpdaterBolt();
+        setField(bolt, "_collector", collector);
+        setField(bolt, "repository", repo);
+        setField(bolt, "useCache", false); // ack() skips the (unprepared) dedup cache in tests
+
+        Tuple t = mock(Tuple.class);
+        org.apache.stormcrawler.Metadata md = new org.apache.stormcrawler.Metadata();
+        bolt.store("https://dst/", org.apache.stormcrawler.persistence.Status.DISCOVERED,
+                md, java.util.Optional.empty(), t);
+
+        verify(repo, times(1)).insertDiscovered(eq("https://dst/"),
+                org.mockito.ArgumentMatchers.anyDouble());
+        verify(collector, times(1)).ack(t); // THE fix: store() acks the tuple
+    }
+
+    @Test
+    void storeFetchErrorAcksTheTuple() throws Exception {
+        OutputCollector collector = mock(OutputCollector.class);
+        FrontierRepository repo = mock(FrontierRepository.class);
+        PostgresStatusUpdaterBolt bolt = new PostgresStatusUpdaterBolt();
+        setField(bolt, "_collector", collector);
+        setField(bolt, "repository", repo);
+        setField(bolt, "useCache", false);
+
+        Tuple t = mock(Tuple.class);
+        bolt.store("https://x/", org.apache.stormcrawler.persistence.Status.FETCH_ERROR,
+                new org.apache.stormcrawler.Metadata(), java.util.Optional.empty(), t);
+
+        verify(repo, times(1)).markTerminal("https://x/", FrontierRepository.STATE_FAILED);
+        verify(collector, times(1)).ack(t);
+    }
+
+    @Test
+    void storeRedirectionMarksTerminalFollowsTargetAndAcks() throws Exception {
+        OutputCollector collector = mock(OutputCollector.class);
+        FrontierRepository repo = mock(FrontierRepository.class);
+        when(repo.findDocId("https://src/")).thenReturn(java.util.OptionalLong.empty());
+        PostgresStatusUpdaterBolt bolt = new PostgresStatusUpdaterBolt();
+        setField(bolt, "_collector", collector);
+        setField(bolt, "repository", repo);
+        setField(bolt, "useCache", false);
+
+        org.apache.stormcrawler.Metadata md = new org.apache.stormcrawler.Metadata();
+        md.setValue("_redirTo", "https://target/");
+        Tuple t = mock(Tuple.class);
+        bolt.store("https://src/", org.apache.stormcrawler.persistence.Status.REDIRECTION,
+                md, java.util.Optional.empty(), t);
+
+        // Source taken out of in_progress (terminal) and target queued (redirect followed).
+        verify(repo, times(1)).markTerminal("https://src/", FrontierRepository.STATE_FETCHED);
+        verify(repo, times(1)).insertDiscovered(eq("https://target/"),
+                org.mockito.ArgumentMatchers.anyDouble());
+        verify(collector, times(1)).ack(t);
+    }
+
     // ---- reflection helper (fields live on the bolt or its StormCrawler superclass) ----
 
     private static void setField(Object target, String name, Object value) throws Exception {

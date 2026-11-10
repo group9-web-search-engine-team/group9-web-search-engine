@@ -85,7 +85,7 @@ config:
   postgres.user: "websearch_crawler"
   postgres.password.env: "WEBSEARCH_PG_PASSWORD"
 
-  s3.bucket: "web-search-engine-group9-2026-corp"
+  s3.bucket: "web-search-engine-group9-crawler-output-20261110-709845"
   s3.raw.prefix: "crawl/raw/smoke-test/"
   s3.region: "us-east-1"
 

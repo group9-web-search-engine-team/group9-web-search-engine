@@ -74,6 +74,17 @@ public class S3RawHtmlBolt extends BaseRichBolt {
     public static final Fields DISCOVERED_LINK_FIELDS =
             new Fields("sourceUrl", "destUrl", "anchor");
 
+    /**
+     * Dedicated stream signalling that a fetched page could NOT be stored in S3, so the
+     * frontier must be updated (otherwise the URL would stay {@code in_progress} forever).
+     * Fields: {@code (url, retryable)}. {@code retryable=true} for an upload exception
+     * (transient S3/network failure -> bounded retry via the existing retry_count/backoff);
+     * {@code retryable=false} for empty/no content (nothing to store -> terminal failure).
+     * The downstream status updater applies the existing retry configuration and counters.
+     */
+    public static final String STORE_FAILURE_STREAM = "s3-store-failure";
+    public static final Fields STORE_FAILURE_FIELDS = new Fields("url", "retryable");
+
     /** Upper bound on outlinks emitted per page, to keep fan-out sane (not a crawl cap). */
     static final int MAX_OUTLINKS_PER_PAGE = 50;
 
@@ -134,16 +145,22 @@ public class S3RawHtmlBolt extends BaseRichBolt {
         if (metadata == null) {
             metadata = new Metadata();
         }
+        LOG.info("S3 execute ENTER: url={} contentLen={} stream={}",
+                url, content == null ? 0 : content.length, tuple.getSourceStreamId());
 
-        // No content to store: do NOT upload and do NOT emit FETCHED. Ack and return.
+        // No content to store: do NOT upload and do NOT emit FETCHED. Signal a TERMINAL
+        // store failure so the frontier does not leave this URL stuck in_progress, then ack.
         if (content == null || content.length == 0) {
-            LOG.debug("No content for {}; skipping S3 store and FETCHED emit", url);
+            LOG.info("S3 execute EXIT: url={} NO_CONTENT -> STORE_FAILURE(terminal), acked", url);
+            collector.emit(STORE_FAILURE_STREAM, tuple, new Values(url, Boolean.FALSE));
             collector.ack(tuple);
             return;
         }
 
         String key = prefix + keyFor(url) + ".html";
         boolean uploaded = false;
+        LOG.info("S3 PutObject BEGIN: bucket={} key={} bytes={} url={}",
+                bucket, key, content.length, url);
         try {
             PutObjectRequest req = PutObjectRequest.builder()
                     .bucket(bucket)
@@ -153,10 +170,19 @@ public class S3RawHtmlBolt extends BaseRichBolt {
             s3.putObject(req, RequestBody.fromBytes(content));
             uploaded = true;
             int n = storedCount.incrementAndGet();
-            LOG.info("Stored raw HTML [{}] s3://{}/{} ({} bytes)", n, bucket, key, content.length);
+            LOG.info("S3 PutObject OK [{}]: s3://{}/{} ({} bytes)", n, bucket, key, content.length);
+        } catch (software.amazon.awssdk.services.s3.model.S3Exception s3e) {
+            // Surface AWS error code (e.g. AccessDenied, NoSuchBucket) explicitly; do NOT swallow.
+            LOG.error("S3 PutObject FAILED (AWS): bucket={} key={} url={} statusCode={} errorCode={} msg={}",
+                    bucket, key, url, s3e.statusCode(),
+                    s3e.awsErrorDetails() == null ? "?" : s3e.awsErrorDetails().errorCode(),
+                    s3e.getMessage());
+            collector.emit(STORE_FAILURE_STREAM, tuple, new Values(url, Boolean.TRUE));
         } catch (Exception e) {
-            // Upload failed: log and do NOT emit FETCHED. Ack so the topology does not hang.
-            LOG.error("S3 upload failed for {} (key {}): {}", url, key, e.toString());
+            // Non-AWS failure (network/timeout/etc.): retryable store failure.
+            LOG.error("S3 PutObject FAILED (non-AWS): bucket={} key={} url={} ex={}",
+                    bucket, key, url, e.toString());
+            collector.emit(STORE_FAILURE_STREAM, tuple, new Values(url, Boolean.TRUE));
         }
 
         if (uploaded) {
@@ -164,6 +190,7 @@ public class S3RawHtmlBolt extends BaseRichBolt {
             emitDiscoveredLinks(tuple, url, content, metadata);
         }
         collector.ack(tuple);
+        LOG.info("S3 execute EXIT: url={} uploaded={} acked", url, uploaded);
     }
 
     /**
@@ -289,6 +316,9 @@ public class S3RawHtmlBolt extends BaseRichBolt {
         declarer.declareStream(S3_STATUS_STREAM, S3_STATUS_FIELDS);
         // Dedicated scalar discovered-links stream (sourceUrl, destUrl, anchor).
         declarer.declareStream(DISCOVERED_LINK_STREAM, DISCOVERED_LINK_FIELDS);
+        // Dedicated scalar store-failure stream (url, retryable) so the frontier is updated
+        // reliably on S3 upload failure / empty content (never left stuck in_progress).
+        declarer.declareStream(STORE_FAILURE_STREAM, STORE_FAILURE_FIELDS);
     }
 
     private static Integer parseNullableInt(String value) {

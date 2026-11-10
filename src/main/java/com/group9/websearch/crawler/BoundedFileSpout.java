@@ -87,8 +87,7 @@ public class BoundedFileSpout extends FileSpout {
     }
 
     /**
-     * Delegating collector that counts emissions and refuses to emit beyond the cap.
-     * This is the authoritative global page limiter.
+     * Delegating collector that counts emissions and refuses to emit beyond the optional cap.
      */
     static final class CountingCollector implements ISpoutOutputCollector {
 

@@ -1,0 +1,21 @@
+# Example cluster configuration for distributed query execution.
+# Copy to config/cluster.properties and fill in your worker addresses.
+# NO addresses are hardcoded in application code; the coordinator loads this file.
+#
+# Five logical term partitions -> physical workers (host:port of each worker's search RPC).
+# Per the deployment design, P5 (special terms) is co-located on the same worker as P4.
+#
+#   P1  a-h
+#   P2  i-m
+#   P3  n-s
+#   P4  t-z
+#   P5  special (digits, symbols, non-a-z)
+worker.P1 = WORKER1_HOST:9301
+worker.P2 = WORKER2_HOST:9301
+worker.P3 = WORKER3_HOST:9301
+worker.P4 = WORKER4_HOST:9301
+worker.P5 = WORKER4_HOST:9301
+
+# Per-query fan-out timeout (milliseconds). A worker that does not answer within this window is
+# recorded as a failed partition and the query returns a partial, clearly-flagged result.
+query.timeoutMillis = 5000

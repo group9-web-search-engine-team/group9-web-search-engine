@@ -39,6 +39,23 @@ public final class CrawlModeManager {
      *                      for a clean-start reset)
      */
     public String apply(CrawlMode mode) throws SQLException {
+        // Backward-compatible default: recover ALL stale in_progress (no time threshold), with
+        // a conservative retry budget. Callers that want time-based recovery use the overload.
+        return apply(mode, 0L, 3);
+    }
+
+    /**
+     * Apply the given mode with TIME-BASED stale recovery for RESUME.
+     *
+     * @param mode             crawl mode (clean-start or resume)
+     * @param staleAfterSecs   staleness threshold in seconds; when &gt; 0, only in_progress rows
+     *                         whose last_attempt is older than this are recovered (so a running
+     *                         crawl's fresh claims are never stolen); when &lt;= 0, ALL stale
+     *                         in_progress rows are recovered (legacy behaviour).
+     * @param maxFetchErrors   retry budget; stale rows that have exhausted it are marked failed.
+     */
+    public String apply(CrawlMode mode, long staleAfterSecs, int maxFetchErrors)
+            throws SQLException {
         switch (mode) {
             case CLEAN_START -> {
                 int[] deleted = repository.resetCrawlTables();
@@ -51,11 +68,22 @@ public final class CrawlModeManager {
                 return summary;
             }
             case RESUME -> {
-                int recovered = repository.recoverStaleInProgress();
-                String summary = String.format(
-                        "RESUME: preserved existing data; recovered %d stale in_progress row(s) to pending. "
-                                + "Continuing eligible pending work.",
-                        recovered);
+                final String summary;
+                if (staleAfterSecs > 0) {
+                    FrontierRepository.StaleRecovery r =
+                            repository.recoverStaleInProgress(staleAfterSecs, maxFetchErrors);
+                    summary = String.format(
+                            "RESUME: preserved existing data; time-based recovery (stale > %ds): "
+                                    + "%d stale in_progress row(s) returned to pending, %d marked "
+                                    + "failed (retries exhausted). Continuing eligible pending work.",
+                            staleAfterSecs, r.recoveredToPending(), r.failedExhausted());
+                } else {
+                    int recovered = repository.recoverStaleInProgress();
+                    summary = String.format(
+                            "RESUME: preserved existing data; recovered %d stale in_progress row(s) "
+                                    + "to pending. Continuing eligible pending work.",
+                            recovered);
+                }
                 LOG.info(summary);
                 return summary;
             }

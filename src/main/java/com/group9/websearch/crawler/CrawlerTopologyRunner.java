@@ -253,11 +253,17 @@ public class CrawlerTopologyRunner extends ConfigurableTopology {
         String user = resolveAdminUser(conf);
         String password = resolveAdminPassword(conf);
 
+        long staleSecs = intConf(conf, CrawlerConstants.STALE_INPROGRESS_SECS_PARAM,
+                CrawlerConstants.DEFAULT_STALE_INPROGRESS_SECS);
+        int maxFetchErrors = intConf(conf, "max.fetch.errors", 3);
         try (java.sql.Connection conn = java.sql.DriverManager.getConnection(url, user, password)) {
             conn.setAutoCommit(true);
             com.group9.websearch.crawler.persistence.FrontierRepository repo =
                     new com.group9.websearch.crawler.persistence.FrontierRepository(conn);
-            String summary = new CrawlModeManager(repo).apply(mode);
+            // Time-based stale recovery on RESUME: a crashed/interrupted LocalCluster leaves
+            // claims in_progress; only claims older than the configurable threshold are
+            // recovered, so a concurrently-running crawl's fresh claims are never stolen.
+            String summary = new CrawlModeManager(repo).apply(mode, staleSecs, maxFetchErrors);
             LOG.info("Crawl mode applied: {}", summary);
             return 0;
         } catch (java.sql.SQLException e) {
@@ -345,7 +351,8 @@ public class CrawlerTopologyRunner extends ConfigurableTopology {
                 .localOrShuffleGrouping("fetch", Constants.StatusStreamName)
                 .localOrShuffleGrouping("parse", Constants.StatusStreamName)
                 .localOrShuffleGrouping("s3", S3RawHtmlBolt.S3_STATUS_STREAM)
-                .localOrShuffleGrouping("s3", S3RawHtmlBolt.DISCOVERED_LINK_STREAM);
+                .localOrShuffleGrouping("s3", S3RawHtmlBolt.DISCOVERED_LINK_STREAM)
+                .localOrShuffleGrouping("s3", S3RawHtmlBolt.STORE_FAILURE_STREAM);
 
         return builder;
     }

@@ -42,6 +42,28 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
     private String jdbcUrl;
     private String dbUser;
     private String dbPassword;
+    /** Max store-failure retries before a URL is marked terminally failed (from max.fetch.errors). */
+    private int maxFetchErrors = 3;
+    /** Base backoff (seconds) between store-failure retries; grows linearly with retry_count. */
+    private int retryBackoffSecs = 120;
+
+    // ---- Pipeline counters (make persistence losses immediately visible) ----
+    private long s3FetchedTuples;      // FETCHED scalar tuples received from the S3 bolt
+    private long documentRowsUpserted; // documents upserted
+    private long urlsMarkedFetched;    // crawl_state -> fetched
+    private long discoveredLinkTuples; // discovered-link tuples received
+    private long linksInserted;        // links rows inserted
+    private long storeFailureTuples;   // S3 store-failure tuples received
+    private long urlsRetried;          // store-failure retries scheduled
+    private long urlsTerminallyFailed; // store-failure terminal fails
+    private long statusTuplesAcked;    // native store() tuples acked
+    private long persistErrors;        // DB/persist exceptions (tuple failed)
+    private long redirectsHandled;     // REDIRECTION status events handled
+    private long redirectTargetsQueued; // redirect targets followed into the frontier
+
+    /** Log the counter snapshot every N status/S3 tuples. */
+    private static final long COUNTER_LOG_INTERVAL = 50L;
+    private long processedSinceLog;
 
     @Override
     @SuppressWarnings("rawtypes")
@@ -74,6 +96,12 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
                     "PostgreSQL password env var '{}' is not set; DB connection will likely fail.",
                     passwordEnv);
         }
+
+        // Reuse the EXISTING retry configuration for store-failure retries (no new keys):
+        // max.fetch.errors caps attempts; fetchInterval.fetch.error (minutes) is the backoff.
+        this.maxFetchErrors = intConf(stormConf, "max.fetch.errors", 3);
+        int fetchErrorIntervalMin = intConf(stormConf, "fetchInterval.fetch.error", 2);
+        this.retryBackoffSecs = Math.max(1, fetchErrorIntervalMin) * 60;
 
         try {
             this.connection =
@@ -111,6 +139,10 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
             handleDiscoveredLink(tuple);
             return;
         }
+        if (S3RawHtmlBolt.STORE_FAILURE_STREAM.equals(stream)) {
+            handleStoreFailure(tuple);
+            return;
+        }
         super.execute(tuple);
     }
 
@@ -125,6 +157,7 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
         String sourceUrl = tuple.getStringByField("sourceUrl");
         String destUrl = tuple.getStringByField("destUrl");
         String anchor = (String) tuple.getValueByField("anchor");
+        discoveredLinkTuples++;
         try {
             // Add the destination to the frontier (idempotent; PK dedup).
             repository.insertDiscovered(destUrl, defaultPriority());
@@ -133,7 +166,10 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
             OptionalLong srcDocId = repository.findDocId(sourceUrl);
             if (srcDocId.isPresent()) {
                 OptionalLong destDocId = repository.findDocId(destUrl);
-                repository.insertLink(srcDocId.getAsLong(), destDocId, destUrl, anchor);
+                if (repository.insertLink(srcDocId.getAsLong(), destDocId, destUrl, anchor)) {
+                    linksInserted++;
+                }
+                LOG.debug("LINK recorded: {} -> {}", sourceUrl, destUrl);
                 // A new parent edge may raise this destination's QMax (if the source page
                 // already has a QT5 score). Recompute-from-scratch is idempotent and never
                 // lowers QMax when the new parent scores lower.
@@ -143,10 +179,74 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
                         sourceUrl, destUrl);
             }
             _collector.ack(tuple);
+            maybeLogCounters();
         } catch (SQLException e) {
+            persistErrors++;
             LOG.error("Failed to persist discovered link {} -> {}: {}", sourceUrl, destUrl, e.toString());
             _collector.fail(tuple);
         }
+    }
+
+    /**
+     * Handle an S3 store failure ({@code (url, retryable)}) so the frontier is updated
+     * reliably and the URL is never left permanently {@code in_progress}:
+     * <ul>
+     *   <li><b>retryable</b> (transient upload failure): if the current {@code retry_count}
+     *       is below {@code max.fetch.errors}, schedule a bounded retry with a linear backoff
+     *       (returns the URL to {@code pending} with a future {@code next_attempt} and
+     *       increments {@code retry_count}); once attempts are exhausted, mark it
+     *       {@code failed}.</li>
+     *   <li><b>non-retryable</b> (empty/no content): mark {@code failed} immediately.</li>
+     * </ul>
+     * Uses only the EXISTING retry configuration, attempt counter and backoff.
+     */
+    private void handleStoreFailure(Tuple tuple) {
+        String url = tuple.getStringByField("url");
+        Boolean retryable = (Boolean) tuple.getValueByField("retryable");
+        storeFailureTuples++;
+        try {
+            if (Boolean.TRUE.equals(retryable)) {
+                int attempts = repository.currentRetryCount(url);
+                if (attempts < maxFetchErrors) {
+                    long backoff = (long) retryBackoffSecs * (attempts + 1L); // linear backoff
+                    repository.scheduleRetry(url, Instant.now().plusSeconds(backoff));
+                    urlsRetried++;
+                    LOG.warn("STATE retry: url={} attempt={}/{} backoff={}s",
+                            url, attempts + 1, maxFetchErrors, backoff);
+                } else {
+                    repository.markTerminal(url, FrontierRepository.STATE_FAILED);
+                    urlsTerminallyFailed++;
+                    LOG.error("STATE failed (retries exhausted {}): url={}", maxFetchErrors, url);
+                }
+            } else {
+                repository.markTerminal(url, FrontierRepository.STATE_FAILED);
+                urlsTerminallyFailed++;
+                LOG.warn("STATE failed (no content): url={}", url);
+            }
+            _collector.ack(tuple);
+            maybeLogCounters();
+        } catch (SQLException e) {
+            persistErrors++;
+            LOG.error("Failed to update frontier after S3 store failure for {}: {}", url, e.toString());
+            _collector.fail(tuple);
+        }
+    }
+
+    /** Periodically log the pipeline counter snapshot so losses are immediately visible. */
+    private void maybeLogCounters() {
+        if (++processedSinceLog % COUNTER_LOG_INTERVAL == 0) {
+            logCounters();
+        }
+    }
+
+    void logCounters() {
+        LOG.info("PIPELINE COUNTERS [status-updater]: s3FetchedTuples={} documentRowsUpserted={} "
+                + "urlsMarkedFetched={} discoveredLinkTuples={} linksInserted={} "
+                + "storeFailureTuples={} urlsRetried={} urlsTerminallyFailed={} "
+                + "redirectsHandled={} redirectTargetsQueued={} statusTuplesAcked={} persistErrors={}",
+                s3FetchedTuples, documentRowsUpserted, urlsMarkedFetched, discoveredLinkTuples,
+                linksInserted, storeFailureTuples, urlsRetried, urlsTerminallyFailed,
+                redirectsHandled, redirectTargetsQueued, statusTuplesAcked, persistErrors);
     }
 
     /**
@@ -161,9 +261,14 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
         String s3Key = (String) tuple.getValueByField("s3Key");
         Double qualityScore = (Double) tuple.getValueByField("qualityScore");
 
+        s3FetchedTuples++;
+        LOG.info("STATUS received: stream=S3_STATUS url={} httpStatus={} contentLength={} s3Key={}",
+                url, httpStatus, contentLength, s3Key);
         try {
             DocumentRecord doc = new DocumentRecord(url, httpStatus, contentLength, s3Key, Instant.now());
             repository.upsertDocument(doc);
+            documentRowsUpserted++;
+            LOG.info("DOC upserted: url={} s3Key={}", url, s3Key);
             // Persist the QT5 quality score (kept distinct from pagerank/QMax). Only when a
             // score is present; the UPDATE is idempotent so retries stay consistent.
             if (qualityScore != null) {
@@ -177,8 +282,12 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
                 }
             }
             repository.markTerminal(url, FrontierRepository.STATE_FETCHED);
+            urlsMarkedFetched++;
+            LOG.info("STATE fetched: url={}", url);
             _collector.ack(tuple);
+            maybeLogCounters();
         } catch (SQLException e) {
+            persistErrors++;
             LOG.error("Failed to persist FETCHED scalars for {}: {}", url, e.toString());
             _collector.fail(tuple);
         }
@@ -197,11 +306,17 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
                     "repository not initialised; prepare() must run first");
         }
 
+        LOG.info("STATUS store(): status={} url={} stream={}",
+                status, url, tuple.getSourceStreamId());
         switch (status) {
-            case DISCOVERED, REDIRECTION -> {
+            case DISCOVERED -> {
+                // Normal recursive discovery: every discovered URL enters the frontier
+                // (deduplicated by PK). No allowlist restriction.
                 repository.insertDiscovered(url, defaultPriority());
                 recordParentEdgeIfPossible(url, metadata);
             }
+
+            case REDIRECTION -> handleRedirection(url, metadata);
 
             case FETCHED -> {
                 persistFetchedDocument(url, metadata);
@@ -220,6 +335,54 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
                             "Unhandled status {} for {}",
                             status,
                             url);
+        }
+
+        // CRITICAL: AbstractStatusUpdaterBolt.execute() calls store() but does NOT ack the
+        // tuple afterwards (it only fails on exception). The store() implementation owns the
+        // ack. Without this, EVERY fetcher/parser status-stream tuple (DISCOVERED outlinks,
+        // REDIRECTION, FETCH_ERROR/ERROR) was left un-acked, so the anchored root spout tuple
+        // never completed, timed out after topology.message.timeout.secs, failed, and was
+        // dropped -> the URL stayed in_progress forever and nothing downstream committed.
+        // ack(tuple, url) also records the URL in the dedup cache (native StormCrawler
+        // behaviour) and calls _collector.ack(tuple).
+        ack(tuple, url);
+        statusTuplesAcked++;
+        LOG.debug("STATUS acked: status={} url={}", status, url);
+    }
+
+    /**
+     * Handle a REDIRECTION status for {@code sourceUrl}:
+     * <ol>
+     *   <li>The source URL yields no content of its own, so take it OUT of the active set
+     *       (otherwise it would stay stranded in {@code in_progress} forever -- a redirect is
+     *       not retryable). It is marked terminal.</li>
+     *   <li>Follow the redirect: queue the target ({@code _redirTo}) into the frontier so its
+     *       content is fetched (normal crawling -- no allowlist restriction), and record the
+     *       source -&gt; target link edge if the source document row exists.</li>
+     * </ol>
+     */
+    private void handleRedirection(String sourceUrl, Metadata metadata) throws SQLException {
+        String target = metadata == null ? null : metadata.getFirstValue("_redirTo");
+        LOG.info("REDIRECT: source={} target={}", sourceUrl, target);
+
+        repository.markTerminal(sourceUrl, FrontierRepository.STATE_FETCHED);
+        urlsMarkedFetched++;
+        redirectsHandled++;
+
+        if (target != null && !target.isBlank()) {
+            boolean inserted = repository.insertDiscovered(target, defaultPriority());
+            redirectTargetsQueued++;
+            LOG.info("REDIRECT followed: queued target={} (newRow={})", target, inserted);
+            OptionalLong srcDocId = repository.findDocId(sourceUrl);
+            if (srcDocId.isPresent()) {
+                if (repository.insertLink(srcDocId.getAsLong(), OptionalLong.empty(), target, null)) {
+                    linksInserted++;
+                }
+            }
+        } else {
+            LOG.warn("REDIRECT target missing (_redirTo absent) for source={}; cannot follow. "
+                    + "Metadata may be empty under LocalCluster; check serializer registration.",
+                    sourceUrl);
         }
     }
 
@@ -291,6 +454,7 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
 
     @Override
     public void cleanup() {
+        logCounters(); // final pipeline-counter snapshot on shutdown
         if (connection != null) {
             try {
                 connection.close();
@@ -321,6 +485,22 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
 
         Object value = conf == null ? null : conf.get(key);
         return value == null ? def : value.toString();
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static int intConf(Map conf, String key, int def) {
+        Object v = conf == null ? null : conf.get(key);
+        if (v == null) {
+            return def;
+        }
+        if (v instanceof Number n) {
+            return n.intValue();
+        }
+        try {
+            return Integer.parseInt(v.toString().trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
     }
 
     private static Integer parseNullableInt(String value) {

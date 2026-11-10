@@ -46,4 +46,21 @@ class CrawlModeManagerTest {
         when(repo.resetCrawlTables()).thenThrow(new SQLException("permission denied for table links"));
         assertThrows(SQLException.class, () -> new CrawlModeManager(repo).apply(CrawlMode.CLEAN_START));
     }
+
+    @Test
+    void resumeTimeBasedRecoveryUsesThresholdAndReportsCounts() throws Exception {
+        FrontierRepository repo = mock(FrontierRepository.class);
+        when(repo.recoverStaleInProgress(600L, 3))
+                .thenReturn(new FrontierRepository.StaleRecovery(5, 2));
+
+        String summary = new CrawlModeManager(repo).apply(CrawlMode.RESUME, 600L, 3);
+
+        verify(repo, times(1)).recoverStaleInProgress(600L, 3);
+        verify(repo, never()).recoverStaleInProgress();     // legacy path NOT used
+        verify(repo, never()).resetCrawlTables();
+        assertTrue(summary.contains("RESUME"));
+        assertTrue(summary.contains("time-based"));
+        assertTrue(summary.contains("5"));
+        assertTrue(summary.contains("2"));
+    }
 }

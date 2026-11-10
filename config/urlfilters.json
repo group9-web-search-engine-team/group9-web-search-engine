@@ -22,7 +22,7 @@
       "class": "org.apache.stormcrawler.filtering.depth.MaxDepthFilter",
       "name": "MaxDepthFilter",
       "params": {
-        "maxDepth": 1
+        "maxDepth": -1
       }
     },
     {

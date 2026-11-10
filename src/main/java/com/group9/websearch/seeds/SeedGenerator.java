@@ -5,9 +5,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.Writer;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,6 +32,16 @@ public final class SeedGenerator {
 
     /** Log progress every N documents so large runs show liveness without flooding logs. */
     private static final long PROGRESS_INTERVAL = 25_000L;
+
+    /**
+     * Splits a {@code metadata.url} field that packs several URLs into one string. BEIR
+     * TREC-COVID frequently joins multiple URLs with a semicolon (optionally followed by
+     * whitespace). We split ONLY on a semicolon + optional whitespace that is immediately
+     * followed by another http/https URL (zero-width lookahead), so a semicolon that is part
+     * of a single URL's path/query is never used as a split point and the {@code http(s)://}
+     * prefix of the next URL is preserved.
+     */
+    private static final Pattern MULTI_URL_SPLIT = Pattern.compile(";\\s*(?=https?://)");
 
     private final ObjectMapper mapper;
 
@@ -111,6 +124,109 @@ public final class SeedGenerator {
     }
 
     /**
+     * Extract ALL canonical URLs from a single JSONL line. A BEIR {@code metadata.url} field
+     * may pack several URLs separated by semicolons (e.g.
+     * {@code "https://a.example/x; https://b.example/y"}); this method splits them with
+     * {@link #MULTI_URL_SPLIT}, trims each, and normalizes each INDEPENDENTLY via
+     * {@link UrlNormalizer#normalize(String)}.
+     *
+     * <p>Statistics are updated consistently with the single-URL path, but at the right
+     * granularity for multiple URLs per document:
+     * <ul>
+     *   <li>the DOCUMENT is counted once (per JSON object), as before;</li>
+     *   <li>malformed JSON / missing / blank url fields are counted exactly as before;</li>
+     *   <li>each individual split candidate that normalizes successfully increments
+     *       {@code urlsFound} (valid URL candidates counted individually);</li>
+     *   <li>each candidate that fails normalization increments
+     *       {@code unsupportedOrInvalidUrl} individually; if EVERY candidate in a non-blank
+     *       field is invalid, the field still contributes at least one invalid count.</li>
+     * </ul>
+     * Corpus-wide deduplication (and per-duplicate counting) is performed by the caller
+     * ({@link #generate}); this method returns candidates in encounter order (duplicates
+     * within one field collapsed) so output ordering stays deterministic.
+     *
+     * @param line  a single line from the corpus file
+     * @param stats the running tally to update
+     * @return the canonical URLs extracted from this line (possibly empty)
+     */
+    public List<String> extractUrlsFromLine(String line, SeedExtractionStats stats) {
+        List<String> canonicalUrls = new ArrayList<>();
+        if (line == null) {
+            return canonicalUrls;
+        }
+        String trimmedLine = line.trim();
+        if (trimmedLine.isEmpty()) {
+            // Blank lines are structural noise, not documents.
+            return canonicalUrls;
+        }
+
+        final JsonNode root;
+        try {
+            root = mapper.readTree(trimmedLine);
+        } catch (IOException e) {
+            stats.incrementMalformedJsonLines();
+            return canonicalUrls;
+        }
+
+        if (root == null || !root.isObject()) {
+            // A JSON scalar/array on its own line is not a valid corpus document.
+            stats.incrementMalformedJsonLines();
+            return canonicalUrls;
+        }
+
+        // From here on we have a document to account for (counted ONCE per document).
+        stats.incrementDocumentsProcessed();
+
+        JsonNode metadata = root.get("metadata");
+        if (metadata == null || !metadata.isObject()) {
+            stats.incrementMissingUrl();
+            return canonicalUrls;
+        }
+
+        JsonNode urlNode = metadata.get("url");
+        if (urlNode == null || urlNode.isNull() || !urlNode.isTextual()) {
+            stats.incrementMissingUrl();
+            return canonicalUrls;
+        }
+
+        String rawField = urlNode.asText();
+        if (rawField == null || rawField.trim().isEmpty()) {
+            stats.incrementBlankUrl();
+            return canonicalUrls;
+        }
+
+        // Split a possibly multi-URL field into individual URL candidates, then trim and
+        // normalize each independently. Deduplicate WITHIN the field in encounter order so a
+        // field that repeats the same URL does not inflate the candidate list.
+        Set<String> perField = new LinkedHashSet<>();
+        boolean anyCandidate = false;
+        for (String part : MULTI_URL_SPLIT.split(rawField)) {
+            String candidate = part.trim();
+            if (candidate.isEmpty()) {
+                continue;
+            }
+            anyCandidate = true;
+            Optional<String> canonical = UrlNormalizer.normalize(candidate);
+            if (canonical.isEmpty()) {
+                stats.incrementUnsupportedOrInvalidUrl();
+                continue;
+            }
+            stats.incrementUrlsFound();
+            if (perField.add(canonical.get())) {
+                canonicalUrls.add(canonical.get());
+            } else {
+                // Duplicate within the SAME field: count it like a cross-document duplicate.
+                stats.incrementDuplicateUrls();
+            }
+        }
+        if (!anyCandidate) {
+            // Non-blank field that split into nothing usable (e.g. only separators).
+            stats.incrementUnsupportedOrInvalidUrl();
+        }
+        return canonicalUrls;
+    }
+
+    /**
      * Stream the corpus from {@code reader}, writing one unique canonical seed URL per
      * line to {@code writer}. Deduplication is deterministic: the first occurrence of a
      * canonical URL is written in encounter order; later duplicates are counted and
@@ -128,9 +244,11 @@ public final class SeedGenerator {
 
         String line;
         while ((line = reader.readLine()) != null) {
-            Optional<String> canonical = extractUrlFromLine(line, stats);
-            if (canonical.isPresent()) {
-                String url = canonical.get();
+            // A single document may yield MULTIPLE URLs (semicolon-separated metadata.url).
+            // Each canonical URL is deduplicated across the ENTIRE corpus here, and each
+            // duplicate is counted individually.
+            List<String> canonicalUrls = extractUrlsFromLine(line, stats);
+            for (String url : canonicalUrls) {
                 if (seen.add(url)) {
                     writer.write(url);
                     writer.write('\n');

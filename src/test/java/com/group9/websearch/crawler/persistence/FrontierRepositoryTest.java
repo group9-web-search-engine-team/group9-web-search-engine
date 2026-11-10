@@ -338,4 +338,52 @@ class FrontierRepositoryTest {
         // Only the SELECT runs; no UPDATE should be issued. We assert it returns empty.
         assertTrue(repo.recomputeQMaxForDestination("https://dest/").isEmpty());
     }
+
+    // ---- Time-based stale in_progress recovery (configurable timeout, retry-aware) ----
+
+    @Test
+    void timeBasedStaleRecoveryReturnsPendingAndFailsExhaustedInOneTransaction() throws SQLException {
+        PreparedStatement failStmt = mock(PreparedStatement.class);
+        PreparedStatement recoverStmt = mock(PreparedStatement.class);
+        when(connection.prepareStatement(org.mockito.ArgumentMatchers.contains("SET state = 'failed'")))
+                .thenReturn(failStmt);
+        when(connection.prepareStatement(org.mockito.ArgumentMatchers.contains("SET state = 'pending'")))
+                .thenReturn(recoverStmt);
+        when(failStmt.executeUpdate()).thenReturn(2);     // 2 stale + exhausted -> failed
+        when(recoverStmt.executeUpdate()).thenReturn(5);  // 5 stale + budget -> pending
+        when(connection.getAutoCommit()).thenReturn(true);
+
+        FrontierRepository.StaleRecovery r = repo.recoverStaleInProgress(600L, 3);
+
+        assertEquals(5, r.recoveredToPending());
+        assertEquals(2, r.failedExhausted());
+        // Both statements bind the staleness threshold and retry budget.
+        verify(failStmt).setLong(1, 600L);
+        verify(failStmt).setInt(2, 3);
+        verify(recoverStmt).setLong(1, 600L);
+        verify(recoverStmt).setInt(2, 3);
+        // Runs in one committed transaction and restores autocommit.
+        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(connection);
+        inOrder.verify(connection).setAutoCommit(false);
+        inOrder.verify(connection).commit();
+        inOrder.verify(connection).setAutoCommit(true);
+    }
+
+    @Test
+    void timeBasedStaleRecoveryRejectsNonPositiveThreshold() {
+        assertThrows(IllegalArgumentException.class, () -> repo.recoverStaleInProgress(0L, 3));
+    }
+
+    @Test
+    void timeBasedStaleRecoveryRollsBackOnError() throws SQLException {
+        PreparedStatement failStmt = mock(PreparedStatement.class);
+        when(connection.prepareStatement(org.mockito.ArgumentMatchers.contains("SET state = 'failed'")))
+                .thenReturn(failStmt);
+        when(connection.getAutoCommit()).thenReturn(true);
+        when(failStmt.executeUpdate()).thenThrow(new SQLException("boom"));
+
+        assertThrows(SQLException.class, () -> repo.recoverStaleInProgress(600L, 3));
+        verify(connection).rollback();
+        verify(connection).setAutoCommit(true);
+    }
 }

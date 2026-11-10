@@ -87,4 +87,15 @@ public final class CrawlerConstants {
     public static final String SEED_DIR_PARAM = "seed.dir";
     /** Seed file name within {@link #SEED_DIR_PARAM}. */
     public static final String SEED_FILE_PARAM = "seed.file";
+
+    // ---- Stale in-progress recovery (RESUME) ----
+
+    /**
+     * A URL left {@code in_progress} with {@code last_attempt} older than this many seconds is
+     * considered stale (a crashed/interrupted claim) and is recovered on RESUME: returned to
+     * {@code pending} if it still has retry budget, otherwise marked {@code failed}.
+     */
+    public static final String STALE_INPROGRESS_SECS_PARAM = "crawl.stale.inprogress.secs";
+    /** Default staleness threshold: 10 minutes (well above the Storm tuple timeout). */
+    public static final int DEFAULT_STALE_INPROGRESS_SECS = 600;
 }

@@ -42,14 +42,14 @@ config:
   http.store.headers: true
   http.content.partial.as.trimmed: true
 
-  # ---------------- Robots.txt handling (safe defaults) ----------------
-  http.robots.file.skip: false
-  http.robots.headers.skip: false
-  http.robots.meta.skip: false
-  # If robots.txt returns 403 treat as allow; if 5xx do NOT blanket-allow (conservative).
+  # ---------------- Robots.txt handling (DISABLED: robots directives are ignored) ----------------
+  http.robots.file.skip: true
+  http.robots.headers.skip: true
+  http.robots.meta.skip: true
+  # Robots compliance is intentionally disabled for this local run.
   http.robots.403.allow: true
-  http.robots.5xx.allow: false
-  robots.noFollow.strict: true
+  http.robots.5xx.allow: true
+  robots.noFollow.strict: false
 
   # ---------------- Redirects (disabled by default; safety filter revalidation is a later stage) ----------------
   http.allow.redirects: false
@@ -87,14 +87,20 @@ config:
   fetchInterval.error: -1
   max.fetch.errors: 3
 
+  # Stale in_progress recovery (RESUME): a claim left in_progress with last_attempt older than
+  # this many seconds is treated as a crashed/interrupted claim and recovered on startup
+  # (returned to pending if it still has retry budget, else marked failed). Must exceed the
+  # Storm tuple timeout so active, in-flight claims are never recovered out from under a run.
+  crawl.stale.inprogress.secs: 600
+
   # URL filters/normalizers (native StormCrawler). File is optional; see config/urlfilters.json.
   urlfilters.config.file: "urlfilters.json"
 
   # ---------------- Group 9 custom keys (read by our bolts/runner) ----------------
   # Seed source (local file; never the S3 seed object). NORMAL crawling uses the
   # BEIR-derived dataset (beir-seed-urls.txt, ~53.7k URLs extracted from BEIR TREC-COVID).
-  # Boundedness comes from the finite seed file, the depth-1 MaxDepthFilter, robots rules
-  # and DB dedup — not from an artificial page cap.
+  # Boundedness comes from the finite seed file, recursively discovered eligible URLs, robots
+  # rules and DB dedup -- not from an artificial depth or page cap.
   #
   # For a SHORT end-to-end smoke test, run with the smoke override config instead:
   #   -conf config/crawler-conf-smoke.yaml
@@ -108,13 +114,14 @@ config:
   postgres.user: "websearch_crawler"
   postgres.password.env: "WEBSEARCH_PG_PASSWORD"
 
-  # S3 raw-HTML storage. Dedicated trec-covid prefix so the benchmark crawl's raw HTML is
-  # isolated from the earlier smoke-test objects. Upload uses the AWS SDK v2 default
-  # credential provider chain.
-  s3.bucket: "web-search-engine-group9-2026-corp"
+  # S3 raw-HTML storage. Writes EXCLUSIVELY to the dedicated crawler OUTPUT bucket under the
+  # trec-covid prefix. The original bucket (web-search-engine-group9-2026-corp) is preserved
+  # and is NOT used as the crawl output destination. Upload uses the AWS SDK v2 default
+  # credential provider chain (no credentials in config).
+  s3.bucket: "web-search-engine-group9-crawler-output-20261110-709845"
   s3.raw.prefix: "crawl/raw/trec-covid/"
   # Region MUST be set to the bucket's region (HeadBucket/GetBucketLocation are denied for
-  # the group9-crawler identity, so the region cannot be auto-discovered). Adjust if needed.
+  # the group9-crawler identity, so the region cannot be auto-discovered).
   s3.region: "us-east-1"
 
   # ---------------- QT5-Small page-quality scorer (OPTIONAL; OFF by default) ----------------
@@ -141,9 +148,12 @@ config:
   distill.boost: 1000.0
 
   # ---------------- Seed emission cap ----------------
-  # Limit the number of seed tuples emitted by BoundedFileSpout. Raised to cover the full
-  # TREC-COVID seed list (~53,684 URLs); lower it again for a short smoke run.
-  crawl.max.seeds: 60000
+  # No seed-count cap: process the COMPLETE configured seed input. A non-positive value
+  # means "emit all seeds" (see BoundedFileSpout). Boundedness comes from the finite seed
+  # file plus recursively discovered eligible URLs, robots rules, per-host politeness and
+  # DB dedup -- NOT an artificial seed/page cap. (The smoke config keeps a small cap for
+  # short end-to-end tests.)
+  crawl.max.seeds: -1
   # ---------------- Storm runtime (bounded local run) ----------------
   topology.workers: 1
   # 2-minute tuple timeout for the bounded smoke crawl.

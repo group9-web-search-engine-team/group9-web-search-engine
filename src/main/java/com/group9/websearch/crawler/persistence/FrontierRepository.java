@@ -80,6 +80,11 @@ public final class FrontierRepository {
     private static final String SELECT_DOC_ID_SQL =
             "SELECT doc_id FROM documents WHERE url = ?";
 
+    // crawl_state: current retry_count for a URL (to bound store-failure retries). Reads the
+    // existing column; performs no DDL.
+    private static final String SELECT_RETRY_COUNT_SQL =
+            "SELECT retry_count FROM crawl_state WHERE url = ?";
+
     // documents.quality_score: set the QT5-Small page-quality score for an existing
     // document, keyed on the unique url. Idempotent UPDATE (reruns overwrite the same row
     // with the same value), so retries never create inconsistent / duplicate records. This
@@ -173,6 +178,26 @@ public final class FrontierRepository {
     private static final String RECOVER_IN_PROGRESS_SQL =
             "UPDATE crawl_state SET state = '" + STATE_PENDING + "', next_attempt = NULL "
             + "WHERE state = '" + STATE_IN_PROGRESS + "'";
+
+    // Time-based stale recovery: return to pending ONLY the in_progress rows whose last_attempt
+    // is older than a configurable staleness threshold (seconds) AND that still have retry
+    // budget (retry_count < maxFetchErrors). Rows that are stale but have exhausted their retry
+    // budget are marked 'failed' (terminal) by a separate statement. Both are idempotent and
+    // safe to run repeatedly: a freshly-claimed (non-stale) in_progress row is never touched,
+    // and a fetched/failed/pending row is never touched. last_attempt is set at claim time, so
+    // "stale" means "claimed longer ago than the threshold and never completed" (a crashed /
+    // interrupted claim). NULL last_attempt is treated as stale (defensive).
+    private static final String RECOVER_STALE_TO_PENDING_SQL =
+            "UPDATE crawl_state SET state = '" + STATE_PENDING + "', next_attempt = NULL "
+            + "WHERE state = '" + STATE_IN_PROGRESS + "' "
+            + "  AND (last_attempt IS NULL OR last_attempt < now() - (? * interval '1 second')) "
+            + "  AND retry_count < ?";
+
+    private static final String FAIL_STALE_EXHAUSTED_SQL =
+            "UPDATE crawl_state SET state = '" + STATE_FAILED + "', last_attempt = now() "
+            + "WHERE state = '" + STATE_IN_PROGRESS + "' "
+            + "  AND (last_attempt IS NULL OR last_attempt < now() - (? * interval '1 second')) "
+            + "  AND retry_count >= ?";
 
     // ---- Distillation graph access -----------------------------------------------------
     // Load the directed link graph keyed by URL: (sourceUrl, destinationUrl). Uses
@@ -396,6 +421,23 @@ public final class FrontierRepository {
         }
     }
 
+    /**
+     * Current {@code retry_count} for a URL in {@code crawl_state} (0 if the row is absent).
+     * Used to bound store-failure retries against {@code max.fetch.errors}. Read-only; no DDL.
+     */
+    public int currentRetryCount(String url) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(SELECT_RETRY_COUNT_SQL)) {
+            ps.setString(1, url);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    int v = rs.getInt(1);
+                    return rs.wasNull() ? 0 : v;
+                }
+                return 0;
+            }
+        }
+    }
+
     /** Look up the {@code doc_id} for a URL, if a document row exists. */
     public OptionalLong findDocId(String url) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(SELECT_DOC_ID_SQL)) {
@@ -476,6 +518,57 @@ public final class FrontierRepository {
     public int recoverStaleInProgress() throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(RECOVER_IN_PROGRESS_SQL)) {
             return ps.executeUpdate();
+        }
+    }
+
+    /** Outcome of a time-based stale recovery: rows returned to pending and rows failed. */
+    public record StaleRecovery(int recoveredToPending, int failedExhausted) {}
+
+    /**
+     * TIME-BASED stale {@code in_progress} recovery (safe to run repeatedly). A URL is "stale"
+     * when it has been {@code in_progress} with a {@code last_attempt} older than
+     * {@code staleAfterSeconds} (a crashed / interrupted claim). Stale rows WITH remaining retry
+     * budget ({@code retry_count < maxFetchErrors}) are returned to {@code pending}; stale rows
+     * that have EXHAUSTED their budget are marked {@code failed}. Freshly-claimed (non-stale)
+     * in_progress rows are left untouched, so a running crawl's active claims are never stolen.
+     * {@code fetched} documents and existing {@code links} are never modified. Idempotent: a
+     * second run finds nothing new to do.
+     *
+     * @param staleAfterSeconds staleness threshold in seconds (must be &gt; 0)
+     * @param maxFetchErrors    retry budget (same cap used by store-failure retries)
+     * @return counts of rows returned to pending and rows terminally failed
+     */
+    public StaleRecovery recoverStaleInProgress(long staleAfterSeconds, int maxFetchErrors)
+            throws SQLException {
+        if (staleAfterSeconds <= 0) {
+            throw new IllegalArgumentException("staleAfterSeconds must be > 0");
+        }
+        boolean priorAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try {
+            int failed;
+            try (PreparedStatement ps = connection.prepareStatement(FAIL_STALE_EXHAUSTED_SQL)) {
+                ps.setLong(1, staleAfterSeconds);
+                ps.setInt(2, maxFetchErrors);
+                failed = ps.executeUpdate();
+            }
+            int recovered;
+            try (PreparedStatement ps = connection.prepareStatement(RECOVER_STALE_TO_PENDING_SQL)) {
+                ps.setLong(1, staleAfterSeconds);
+                ps.setInt(2, maxFetchErrors);
+                recovered = ps.executeUpdate();
+            }
+            connection.commit();
+            return new StaleRecovery(recovered, failed);
+        } catch (SQLException e) {
+            try {
+                connection.rollback();
+            } catch (SQLException rb) {
+                e.addSuppressed(rb);
+            }
+            throw e;
+        } finally {
+            connection.setAutoCommit(priorAutoCommit);
         }
     }
 

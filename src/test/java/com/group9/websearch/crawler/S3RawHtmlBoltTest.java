@@ -180,13 +180,19 @@ class S3RawHtmlBoltTest {
         Tuple t = tupleWith("https://example.com/", "<html/>".getBytes(StandardCharsets.UTF_8), fetchedMetadata());
         bolt.execute(t);
 
-        verify(collector, never()).emit(anyString(), any(Tuple.class), any(Values.class));
+        // No FETCHED emit, but a RETRYABLE store-failure signal so the frontier is updated
+        // (URL not left stuck in_progress). Still acked exactly once.
+        verify(collector, never())
+                .emit(eq(S3RawHtmlBolt.S3_STATUS_STREAM), any(Tuple.class), any(Values.class));
+        verify(collector, times(1))
+                .emit(eq(S3RawHtmlBolt.STORE_FAILURE_STREAM), eq(t),
+                        eq(new Values("https://example.com/", Boolean.TRUE)));
         verify(collector, never()).emit(any(Tuple.class), any(Values.class));
         verify(collector, times(1)).ack(t);
     }
 
     @Test
-    void emptyContentDoesNotEmitFetchedButAcks() throws Exception {
+    void emptyContentEmitsTerminalStoreFailureAndAcks() throws Exception {
         OutputCollector collector = mock(OutputCollector.class);
         S3Client s3 = mock(S3Client.class);
         S3RawHtmlBolt bolt = newBolt(collector, s3);
@@ -194,7 +200,13 @@ class S3RawHtmlBoltTest {
         Tuple t = tupleWith("https://example.com/", new byte[0], new Metadata());
         bolt.execute(t);
 
-        verify(collector, never()).emit(anyString(), any(Tuple.class), any(Values.class));
+        // No FETCHED emit; a NON-retryable (terminal) store-failure signal is emitted so the
+        // frontier marks the URL failed instead of leaving it in_progress. Still acked once.
+        verify(collector, never())
+                .emit(eq(S3RawHtmlBolt.S3_STATUS_STREAM), any(Tuple.class), any(Values.class));
+        verify(collector, times(1))
+                .emit(eq(S3RawHtmlBolt.STORE_FAILURE_STREAM), eq(t),
+                        eq(new Values("https://example.com/", Boolean.FALSE)));
         verify(collector, times(1)).ack(t);
         // No upload attempted for empty content.
         verify(s3, never()).putObject(any(PutObjectRequest.class), any(RequestBody.class));
