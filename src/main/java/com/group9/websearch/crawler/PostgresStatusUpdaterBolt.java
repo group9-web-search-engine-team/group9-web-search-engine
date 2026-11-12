@@ -29,6 +29,18 @@ import org.slf4j.LoggerFactory;
  * FETCHED -> documents row and fetched state
  * FETCH_ERROR / ERROR -> failed state
  *
+ * <p>Dataset crawl policy:
+ * <ul>
+ *   <li>DISCOVERED from the fetcher (a redirect target) is always enqueued; DISCOVERED
+ *       outlinks from the parser / S3 link stream are recorded as link-graph edges and only
+ *       enqueued when {@code crawl.follow.outlinks} is true.</li>
+ *   <li>Redirect targets and outlinks pass through {@link DatasetUrlRewriter}.</li>
+ *   <li>FETCH_ERROR (every non-200/304/3xx response in StormCrawler 3.1, plus network
+ *       exceptions) is retried with back-off only when transient (429, 5xx, or a
+ *       {@code fetch.exception}); otherwise it fails immediately. Every failure logs one
+ *       {@code CRAWL-FAIL ... cause=...} line.</li>
+ * </ul>
+ *
  * <p>The PostgreSQL password is read from the configured environment variable.
  */
 public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
@@ -42,6 +54,13 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
     private String jdbcUrl;
     private String dbUser;
     private String dbPassword;
+    /** Config key: enqueue parsed outlinks into the frontier (dataset config: false). */
+    public static final String FOLLOW_OUTLINKS_PARAM = "crawl.follow.outlinks";
+    /** Component id of the FetcherBolt in {@link CrawlerTopologyRunner#buildTopology}. */
+    static final String FETCH_COMPONENT = "fetch";
+    /** Follow parsed outlinks. True when built without prepare() (unit tests) = old behaviour. */
+    private boolean followOutlinks = true;
+
     /** Max store-failure retries before a URL is marked terminally failed (from max.fetch.errors). */
     private int maxFetchErrors = 3;
     /** Base backoff (seconds) between store-failure retries; grows linearly with retry_count. */
@@ -102,6 +121,9 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
         this.maxFetchErrors = intConf(stormConf, "max.fetch.errors", 3);
         int fetchErrorIntervalMin = intConf(stormConf, "fetchInterval.fetch.error", 2);
         this.retryBackoffSecs = Math.max(1, fetchErrorIntervalMin) * 60;
+        this.followOutlinks = boolConf(stormConf, FOLLOW_OUTLINKS_PARAM, false);
+        LOG.info("Frontier policy: followOutlinks={}, maxFetchErrors={}, retryBackoffSecs={}",
+                followOutlinks, maxFetchErrors, retryBackoffSecs);
 
         try {
             this.connection =
@@ -155,12 +177,15 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
      */
     private void handleDiscoveredLink(Tuple tuple) {
         String sourceUrl = tuple.getStringByField("sourceUrl");
-        String destUrl = tuple.getStringByField("destUrl");
+        String destUrl = DatasetUrlRewriter.rewrite(tuple.getStringByField("destUrl"));
         String anchor = (String) tuple.getValueByField("anchor");
         discoveredLinkTuples++;
         try {
-            // Add the destination to the frontier (idempotent; PK dedup).
-            repository.insertDiscovered(destUrl, defaultPriority());
+            // Add the destination to the frontier (idempotent; PK dedup) only when the crawl
+            // expands beyond the seed set; the edge below is recorded either way.
+            if (followOutlinks) {
+                repository.insertDiscovered(destUrl, defaultPriority());
+            }
 
             // Record the directed edge if the source document is known.
             OptionalLong srcDocId = repository.findDocId(sourceUrl);
@@ -310,9 +335,12 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
                 status, url, tuple.getSourceStreamId());
         switch (status) {
             case DISCOVERED -> {
-                // Normal recursive discovery: every discovered URL enters the frontier
-                // (deduplicated by PK). No allowlist restriction.
-                repository.insertDiscovered(url, defaultPriority());
+                // A DISCOVERED tuple from the fetcher is a redirect target and is always
+                // fetched; parser outlinks are enqueued only when crawl.follow.outlinks is
+                // true (deduplicated by PK either way). The edge is always recorded.
+                if (followOutlinks || FETCH_COMPONENT.equals(sourceComponent(tuple))) {
+                    repository.insertDiscovered(url, defaultPriority());
+                }
                 recordParentEdgeIfPossible(url, metadata);
             }
 
@@ -325,10 +353,14 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
                         FrontierRepository.STATE_FETCHED);
             }
 
-            case FETCH_ERROR, ERROR ->
-                    repository.markTerminal(
-                            url,
-                            FrontierRepository.STATE_FAILED);
+            case FETCH_ERROR -> handleFetchError(url, metadata);
+
+            case ERROR -> {
+                logFailure(url, status, metadata, "permanent");
+                // Seeds are not in crawl_state yet; make sure the failure is recorded.
+                repository.insertDiscovered(url, defaultPriority());
+                repository.markTerminal(url, FrontierRepository.STATE_FAILED);
+            }
 
             default ->
                     LOG.warn(
@@ -362,7 +394,8 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
      * </ol>
      */
     private void handleRedirection(String sourceUrl, Metadata metadata) throws SQLException {
-        String target = metadata == null ? null : metadata.getFirstValue("_redirTo");
+        String target = DatasetUrlRewriter.rewrite(
+                metadata == null ? null : metadata.getFirstValue("_redirTo"));
         LOG.info("REDIRECT: source={} target={}", sourceUrl, target);
 
         repository.markTerminal(sourceUrl, FrontierRepository.STATE_FETCHED);
@@ -383,6 +416,57 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
             LOG.warn("REDIRECT target missing (_redirTo absent) for source={}; cannot follow. "
                     + "Metadata may be empty under LocalCluster; check serializer registration.",
                     sourceUrl);
+        }
+    }
+
+    /**
+     * Retry a FETCH_ERROR only when it is transient (HTTP 429 / 5xx, or a network-level
+     * {@code fetch.exception} such as a timeout); 4xx, 203 bot-check pages etc. fail at once.
+     * Uses the same budget ({@code max.fetch.errors}) and linear back-off as store failures.
+     */
+    private void handleFetchError(String url, Metadata metadata) throws SQLException {
+        Integer code = parseNullableInt(metaValue(metadata, "fetch.statusCode"));
+        boolean transientError = (code != null && (code == 429 || code >= 500))
+                || (code == null && metaValue(metadata, "fetch.exception") != null);
+        repository.insertDiscovered(url, defaultPriority());
+        int attempts = transientError ? repository.currentRetryCount(url) : 0;
+        if (transientError && attempts < maxFetchErrors) {
+            long backoff = (long) retryBackoffSecs * (attempts + 1L);
+            logFailure(url, Status.FETCH_ERROR, metadata,
+                    "retry " + (attempts + 1) + "/" + maxFetchErrors + " in " + backoff + "s");
+            repository.scheduleRetry(url, Instant.now().plusSeconds(backoff));
+            urlsRetried++;
+        } else {
+            logFailure(url, Status.FETCH_ERROR, metadata, "permanent");
+            repository.markTerminal(url, FrontierRepository.STATE_FAILED);
+        }
+    }
+
+    /**
+     * One greppable line per failure so the reasons can be tallied afterwards, e.g.
+     * {@code grep CRAWL-FAIL crawler.log | sed 's/.*cause=//' | sort | uniq -c}.
+     */
+    private static void logFailure(String url, Status status, Metadata metadata, String outcome) {
+        String cause = metaValue(metadata, "error.cause");
+        if (cause == null) {
+            cause = metaValue(metadata, "fetch.exception");
+        }
+        if (cause == null) {
+            String code = metaValue(metadata, "fetch.statusCode");
+            cause = code == null ? "unknown" : "http-" + code;
+        }
+        LOG.info("CRAWL-FAIL status={} outcome={} url={} cause={}", status, outcome, url, cause);
+    }
+
+    private static String metaValue(Metadata metadata, String key) {
+        return metadata == null ? null : metadata.getFirstValue(key);
+    }
+
+    private static String sourceComponent(Tuple tuple) {
+        try {
+            return tuple == null ? null : tuple.getSourceComponent();
+        } catch (RuntimeException e) {
+            return null;
         }
     }
 
@@ -485,6 +569,18 @@ public class PostgresStatusUpdaterBolt extends AbstractStatusUpdaterBolt {
 
         Object value = conf == null ? null : conf.get(key);
         return value == null ? def : value.toString();
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static boolean boolConf(Map conf, String key, boolean def) {
+        Object v = conf == null ? null : conf.get(key);
+        if (v == null) {
+            return def;
+        }
+        if (v instanceof Boolean b) {
+            return b;
+        }
+        return Boolean.parseBoolean(v.toString().trim());
     }
 
     @SuppressWarnings("rawtypes")

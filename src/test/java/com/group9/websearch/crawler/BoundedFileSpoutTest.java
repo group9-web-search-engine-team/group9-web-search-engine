@@ -85,4 +85,23 @@ class BoundedFileSpoutTest {
         capped.emit("default", List.of("https://example.com/b"), "b");
         assertTrue(capped.reachedCap());
     }
+
+    @Test
+    void rewritesSeedUrlAndSkipsAlreadyFetchedSeeds() {
+        RecordingCollector rec = new RecordingCollector();
+        java.util.Set<String> done = java.util.Set.of("https://pmc.ncbi.nlm.nih.gov/articles/PMC2/");
+        BoundedFileSpout.CountingCollector c = new BoundedFileSpout.CountingCollector(
+                rec, 10, DatasetUrlRewriter::rewrite, done::contains);
+
+        c.emit("default", new ArrayList<>(List.of("https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1/", "md")), "m1");
+        c.emit("default", new ArrayList<>(List.of("https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2/", "md")), "m2");
+        c.emit("default", new ArrayList<>(List.of("https://doi.org/10.1/x", "md")), "m3");
+
+        assertEquals(2, rec.emitted.size());
+        assertEquals("https://pmc.ncbi.nlm.nih.gov/articles/PMC1/", rec.emitted.get(0).get(0));
+        assertEquals("md", rec.emitted.get(0).get(1));
+        assertEquals("https://doi.org/10.1/x", rec.emitted.get(1).get(0));
+        assertEquals(1, c.skipped());
+        assertEquals(2, c.emitted(), "skipped seeds must not count towards the cap");
+    }
 }

@@ -202,6 +202,112 @@ class PostgresStatusUpdaterBoltTest {
         verify(collector, times(1)).ack(t);
     }
 
+    // ---- dataset crawl policy: outlinks, redirect targets, URL rewrite, retries ----
+
+    private static PostgresStatusUpdaterBolt policyBolt(FrontierRepository repo, OutputCollector c,
+            boolean follow) throws Exception {
+        PostgresStatusUpdaterBolt bolt = new PostgresStatusUpdaterBolt();
+        setField(bolt, "_collector", c);
+        setField(bolt, "repository", repo);
+        setField(bolt, "useCache", false);
+        setField(bolt, "followOutlinks", follow);
+        return bolt;
+    }
+
+    private static Tuple fromComponent(String component) {
+        Tuple t = mock(Tuple.class);
+        when(t.getSourceComponent()).thenReturn(component);
+        return t;
+    }
+
+    @Test
+    void redirectTargetIsAlwaysEnqueuedButParserOutlinkOnlyWhenFollowing() throws Exception {
+        FrontierRepository repo = mock(FrontierRepository.class);
+        PostgresStatusUpdaterBolt bolt = policyBolt(repo, mock(OutputCollector.class), false);
+        org.apache.stormcrawler.Metadata md = new org.apache.stormcrawler.Metadata();
+
+        bolt.store("https://publisher.example/a", org.apache.stormcrawler.persistence.Status.DISCOVERED,
+                md, java.util.Optional.empty(), fromComponent("fetch"));
+        bolt.store("https://pmc.ncbi.nlm.nih.gov/about/", org.apache.stormcrawler.persistence.Status.DISCOVERED,
+                md, java.util.Optional.empty(), fromComponent("parse"));
+
+        verify(repo).insertDiscovered(eq("https://publisher.example/a"), org.mockito.ArgumentMatchers.anyDouble());
+        verify(repo, org.mockito.Mockito.never()).insertDiscovered(
+                eq("https://pmc.ncbi.nlm.nih.gov/about/"), org.mockito.ArgumentMatchers.anyDouble());
+    }
+
+    @Test
+    void redirectTargetIsRewrittenToCrawlableUrl() throws Exception {
+        FrontierRepository repo = mock(FrontierRepository.class);
+        when(repo.findDocId(org.mockito.ArgumentMatchers.anyString())).thenReturn(java.util.OptionalLong.empty());
+        PostgresStatusUpdaterBolt bolt = policyBolt(repo, mock(OutputCollector.class), false);
+        org.apache.stormcrawler.Metadata md = new org.apache.stormcrawler.Metadata();
+        md.setValue("_redirTo", "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC42/");
+
+        bolt.store("https://doi.org/10.1/x", org.apache.stormcrawler.persistence.Status.REDIRECTION,
+                md, java.util.Optional.empty(), fromComponent("fetch"));
+
+        verify(repo).insertDiscovered(eq("https://pmc.ncbi.nlm.nih.gov/articles/PMC42/"),
+                org.mockito.ArgumentMatchers.anyDouble());
+    }
+
+    @Test
+    void s3OutlinkRecordsRewrittenEdgeButIsNotEnqueuedWhenNotFollowing() throws Exception {
+        OutputCollector collector = mock(OutputCollector.class);
+        FrontierRepository repo = mock(FrontierRepository.class);
+        when(repo.findDocId("https://src/")).thenReturn(java.util.OptionalLong.of(7L));
+        when(repo.findDocId(org.mockito.ArgumentMatchers.startsWith("https://pmc."))).thenReturn(java.util.OptionalLong.empty());
+        PostgresStatusUpdaterBolt bolt = policyBolt(repo, collector, false);
+
+        Tuple t = mock(Tuple.class);
+        when(t.getSourceStreamId()).thenReturn(S3RawHtmlBolt.DISCOVERED_LINK_STREAM);
+        when(t.getStringByField("sourceUrl")).thenReturn("https://src/");
+        when(t.getStringByField("destUrl")).thenReturn("https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9/");
+        when(t.getValueByField("anchor")).thenReturn("ref");
+        bolt.execute(t);
+
+        verify(repo, org.mockito.Mockito.never()).insertDiscovered(
+                org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyDouble());
+        verify(repo).insertLink(eq(7L), eq(java.util.OptionalLong.empty()),
+                eq("https://pmc.ncbi.nlm.nih.gov/articles/PMC9/"), eq("ref"));
+        verify(collector).ack(t);
+    }
+
+    @Test
+    void transientFetchErrorIsRetriedUntilBudgetIsSpent() throws Exception {
+        FrontierRepository repo = mock(FrontierRepository.class);
+        PostgresStatusUpdaterBolt bolt = policyBolt(repo, mock(OutputCollector.class), false);
+        setField(bolt, "maxFetchErrors", 2);
+        org.apache.stormcrawler.Metadata md = new org.apache.stormcrawler.Metadata();
+        md.setValue("fetch.statusCode", "503");
+
+        when(repo.currentRetryCount("https://x/")).thenReturn(0);
+        bolt.store("https://x/", org.apache.stormcrawler.persistence.Status.FETCH_ERROR, md,
+                java.util.Optional.empty(), fromComponent("fetch"));
+        verify(repo).scheduleRetry(eq("https://x/"), org.mockito.ArgumentMatchers.any());
+        verify(repo, org.mockito.Mockito.never()).markTerminal("https://x/", FrontierRepository.STATE_FAILED);
+
+        when(repo.currentRetryCount("https://x/")).thenReturn(2);
+        bolt.store("https://x/", org.apache.stormcrawler.persistence.Status.FETCH_ERROR, md,
+                java.util.Optional.empty(), fromComponent("fetch"));
+        verify(repo).markTerminal("https://x/", FrontierRepository.STATE_FAILED);
+    }
+
+    @Test
+    void permanentFetchErrorFailsImmediately() throws Exception {
+        FrontierRepository repo = mock(FrontierRepository.class);
+        PostgresStatusUpdaterBolt bolt = policyBolt(repo, mock(OutputCollector.class), false);
+        org.apache.stormcrawler.Metadata md = new org.apache.stormcrawler.Metadata();
+        md.setValue("fetch.statusCode", "203"); // PubMed bot-check page
+
+        bolt.store("https://pubmed.ncbi.nlm.nih.gov/1/", org.apache.stormcrawler.persistence.Status.FETCH_ERROR,
+                md, java.util.Optional.empty(), fromComponent("fetch"));
+
+        verify(repo).markTerminal("https://pubmed.ncbi.nlm.nih.gov/1/", FrontierRepository.STATE_FAILED);
+        verify(repo, org.mockito.Mockito.never()).scheduleRetry(
+                org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any());
+    }
+
     // ---- reflection helper (fields live on the bolt or its StormCrawler superclass) ----
 
     private static void setField(Object target, String name, Object value) throws Exception {

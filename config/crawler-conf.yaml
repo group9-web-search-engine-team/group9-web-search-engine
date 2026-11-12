@@ -42,17 +42,27 @@ config:
   http.store.headers: true
   http.content.partial.as.trimmed: true
 
-  # ---------------- Robots.txt handling (DISABLED: robots directives are ignored) ----------------
-  http.robots.file.skip: true
-  http.robots.headers.skip: true
-  http.robots.meta.skip: true
-  # Robots compliance is intentionally disabled for this local run.
+  # ---------------- Robots.txt handling (compliant) ----------------
+  # Robots compliance is ON. The dataset seeds were "denied by robots.txt" only because the
+  # 2020 CORD-19 URLs point at www.ncbi.nlm.nih.gov/pmc/articles/ (now Disallowed after PMC
+  # moved). DatasetUrlRewriter maps them to pmc.ncbi.nlm.nih.gov/articles/, which robots.txt
+  # explicitly allows, so ignoring robots.txt is no longer needed.
+  http.robots.file.skip: false
+  http.robots.headers.skip: false
+  http.robots.meta.skip: false
+  # If robots.txt returns 403 treat as allow; if 5xx do NOT blanket-allow (conservative).
   http.robots.403.allow: true
-  http.robots.5xx.allow: true
-  robots.noFollow.strict: false
+  http.robots.5xx.allow: false
+  robots.noFollow.strict: true
 
-  # ---------------- Redirects (disabled by default; safety filter revalidation is a later stage) ----------------
+  # ---------------- Redirects ----------------
+  # http.allow.redirects only controls redirect-following INSIDE the HTTP client (which would
+  # skip the target host's robots.txt), so it stays false. The StormCrawler key that matters
+  # is redirections.allowed: the FetcherBolt then emits each 3xx target as a DISCOVERED URL
+  # (through the URL filters) and the frontier fetches it with its own robots.txt check.
+  # Required for the 6.5k doi.org seeds and for http->https hops.
   http.allow.redirects: false
+  redirections.allowed: true
 
   # ---------------- Only HTTP/HTTPS protocols (no file:) ----------------
   protocols: "http,https"
@@ -72,7 +82,13 @@ config:
   metadata.track.path: true
   metadata.transfer:
     - parent.url
+  # Keys that reach PostgresStatusUpdaterBolt.store(); StormCrawler strips everything else.
+  # fetch.statusCode / fetch.exception are needed to tell transient errors (retry) from
+  # permanent ones, and anchor for link-graph anchor text.
   metadata.persist:
+    - fetch.statusCode
+    - fetch.exception
+    - anchor
     - _redirTo
     - error.cause
     - error.source
@@ -96,6 +112,18 @@ config:
   # URL filters/normalizers (native StormCrawler). File is optional; see config/urlfilters.json.
   urlfilters.config.file: "urlfilters.json"
 
+  # ---------------- Dataset crawl policy (Group 9) ----------------
+  # Rewrite stale CORD-19 URL shapes to their current crawlable page (old PMC host ->
+  # pmc.ncbi.nlm.nih.gov, arXiv PDF -> /abs page, ...). See DatasetUrlRewriter.
+  crawl.rewrite.dataset.urls: true
+  # false = fetch ONLY the dataset seeds (+ their redirect targets); outlinks are still
+  # recorded in the links table. true = also crawl outlinks (wanders off-dataset).
+  crawl.follow.outlinks: false
+  # On restart, do not re-emit seeds already fetched/redirected in crawl_state.
+  crawl.seeds.skip.done: true
+  # Transient fetch errors (429, 5xx, timeouts/connection errors) are retried up to
+  # max.fetch.errors times with a linear back-off of fetchInterval.fetch.error minutes.
+
   # ---------------- Group 9 custom keys (read by our bolts/runner) ----------------
   # Seed source (local file; never the S3 seed object). NORMAL crawling uses the
   # BEIR-derived dataset (beir-seed-urls.txt, ~53.7k URLs extracted from BEIR TREC-COVID).
@@ -106,7 +134,9 @@ config:
   #   -conf config/crawler-conf-smoke.yaml
   # which switches seed.file to smoke-seeds.txt (3 URLs) and sets crawl.max.seeds.
   seed.dir: "config"
-  seed.file: "beir-seed-urls.txt"
+  # Prepared from beir-seed-urls.txt by DatasetSeedPreparer (rewritten, deduplicated and
+  # interleaved by host so per-host politeness queues run in parallel).
+  seed.file: "beir-seed-urls.dataset.txt"
 
   # PostgreSQL target. Use the dedicated, NON-superuser role websearch_crawler.
   # The password is resolved from the named env var at runtime (never stored here).
@@ -156,6 +186,8 @@ config:
   crawl.max.seeds: -1
   # ---------------- Storm runtime (bounded local run) ----------------
   topology.workers: 1
-  # 2-minute tuple timeout for the bounded smoke crawl.
-  topology.message.timeout.secs: 120
-  topology.max.spout.pending: 5
+  # With hosts interleaved, ~50 in-flight seeds keep several host queues busy at once
+  # (5 meant at most 5 URLs in flight, i.e. one host at a time). The timeout must exceed
+  # the longest per-host queue wait: 50 URLs x 15 s arXiv crawl-delay worst case.
+  topology.message.timeout.secs: 600
+  topology.max.spout.pending: 50

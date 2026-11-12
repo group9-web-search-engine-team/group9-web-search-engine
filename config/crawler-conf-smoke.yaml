@@ -43,7 +43,13 @@ config:
   robots.noFollow.strict: true
 
   # ---------------- Redirects ----------------
+  # http.allow.redirects only controls redirect-following INSIDE the HTTP client (which would
+  # skip the target host's robots.txt), so it stays false. The StormCrawler key that matters
+  # is redirections.allowed: the FetcherBolt then emits each 3xx target as a DISCOVERED URL
+  # (through the URL filters) and the frontier fetches it with its own robots.txt check.
+  # Required for the 6.5k doi.org seeds and for http->https hops.
   http.allow.redirects: false
+  redirections.allowed: true
 
   # ---------------- Only HTTP/HTTPS protocols ----------------
   protocols: "http,https"
@@ -61,7 +67,13 @@ config:
   metadata.track.path: true
   metadata.transfer:
     - parent.url
+  # Keys that reach PostgresStatusUpdaterBolt.store(); StormCrawler strips everything else.
+  # fetch.statusCode / fetch.exception are needed to tell transient errors (retry) from
+  # permanent ones, and anchor for link-graph anchor text.
   metadata.persist:
+    - fetch.statusCode
+    - fetch.exception
+    - anchor
     - _redirTo
     - error.cause
     - error.source
@@ -76,6 +88,17 @@ config:
   max.fetch.errors: 3
 
   urlfilters.config.file: "urlfilters.json"
+
+  # ---------------- Dataset crawl policy (Group 9) ----------------
+  # Rewrite stale CORD-19 URL shapes to their current crawlable page (old PMC host ->
+  # pmc.ncbi.nlm.nih.gov, arXiv PDF -> /abs page, ...). See DatasetUrlRewriter.
+  crawl.rewrite.dataset.urls: true
+  # Smoke test keeps following outlinks to exercise the link-graph crawl loop.
+  crawl.follow.outlinks: true
+  # On restart, do not re-emit seeds already fetched/redirected in crawl_state.
+  crawl.seeds.skip.done: true
+  # Transient fetch errors (429, 5xx, timeouts/connection errors) are retried up to
+  # max.fetch.errors times with a linear back-off of fetchInterval.fetch.error minutes.
 
   # ---------------- Group 9 custom keys (SMOKE-TEST values) ----------------
   seed.dir: "config"

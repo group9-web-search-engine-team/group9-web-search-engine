@@ -1,6 +1,11 @@
 {
   "org.apache.stormcrawler.filtering.URLFilters": [
     {
+      "class": "com.group9.websearch.crawler.DatasetUrlRewriteFilter",
+      "name": "DatasetUrlRewriteFilter",
+      "params": {}
+    },
+    {
       "class": "org.apache.stormcrawler.filtering.basic.BasicURLNormalizer",
       "name": "BasicURLNormalizer",
       "params": {
