@@ -188,7 +188,7 @@ public final class RetrievalMetrics {
     }
 
     /**
-     * NDCG@k with graded relevance. DCG uses gain = grade and the standard
+     * NDCG@k with graded relevance. DCG uses gain = (2^grade - 1) and the standard
      * {@code 1/log2(rank+1)} discount; the ideal DCG (IDCG) is computed from the best possible
      * ordering of all judged grades for the query. Unjudged retrieved documents are REMOVED
      * before scoring (judged-only condensed list), so they neither add gain nor consume a
@@ -204,8 +204,9 @@ public final class RetrievalMetrics {
         double dcg = 0.0;
         for (int i = 0; i < limit; i++) {
             Integer g = grades.get(r.get(i));
-            int gain = (g == null) ? 0 : Math.max(0, g);
-            if (gain > 0) {
+            int grade = (g == null) ? 0 : Math.max(0, g);
+            if (grade > 0) {
+                double gain = Math.pow(2.0, grade) - 1.0; // exponential gain: 2^grade - 1
                 dcg += gain / (Math.log(i + 2) / Math.log(2)); // rank i (0-based) -> log2(i+2)
             }
         }
@@ -213,19 +214,20 @@ public final class RetrievalMetrics {
         return idcg == 0.0 ? 0.0 : dcg / idcg;
     }
 
-    /** IDCG@k: DCG of the best ordering (grades sorted descending), gains >= 0. */
+    /** IDCG@k: DCG of the best ordering (grades sorted descending), gains = 2^grade - 1. */
     static double idealDcg(Map<String, Integer> grades, int k) {
-        List<Integer> gains = new java.util.ArrayList<>();
+        List<Integer> gradeList = new java.util.ArrayList<>();
         for (int g : grades.values()) {
             if (g > 0) {
-                gains.add(g);
+                gradeList.add(g);
             }
         }
-        gains.sort(java.util.Collections.reverseOrder());
-        int limit = Math.min(k, gains.size());
+        gradeList.sort(java.util.Collections.reverseOrder());
+        int limit = Math.min(k, gradeList.size());
         double idcg = 0.0;
         for (int i = 0; i < limit; i++) {
-            idcg += gains.get(i) / (Math.log(i + 2) / Math.log(2));
+            double gain = Math.pow(2.0, gradeList.get(i)) - 1.0; // exponential gain: 2^grade - 1
+            idcg += gain / (Math.log(i + 2) / Math.log(2));
         }
         return idcg;
     }
